@@ -138,6 +138,52 @@
       color: var(--muted);
       margin-bottom: 1rem;
     }
+    .card-title .count {
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--muted);
+      margin-left: 0.4rem;
+    }
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .card-header .card-title { margin-bottom: 0; }
+
+    /* ── Filter bar (Measurements) ────────────────────────────────────── */
+    .filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      align-items: center;
+      margin-bottom: 1rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .filter-bar input[type="text"] { min-width: 220px; flex: 1 1 220px; }
+    .filter-bar input[type="date"] { min-width: 160px; }
+    .btn-clear-filter {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    /* ── Pagination ────────────────────────────────────────────────────── */
+    .btn-icon {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.25rem 0.55rem;
+      font-size: 0.85rem;
+      border-radius: 6px;
+    }
+    .btn-icon:hover { background: var(--surface2); }
+    .empty-row td { text-align: center; color: var(--muted); padding: 2rem; }
 
     /* ── Section 1 — Session Control ───────────────────────────────────── */
     .session-row {
@@ -564,12 +610,13 @@
     .img-btn-inner {
       background: transparent;
       border: 1px solid var(--border);
-      color: var(--text);
-      padding: 0.2rem 0.5rem;
-      font-size: 1rem;
+      width: 28px;
+      height: 28px;
+      padding: 0;
       border-radius: 4px;
+      display: inline-block;
     }
-    .img-btn-inner:hover { background: var(--surface); }
+    .img-btn-inner:hover { background: var(--surface2); border-color: var(--muted); }
     .no-img { color: var(--border); }
 
     @keyframes row-highlight {
@@ -615,6 +662,143 @@
       line-height: 1;
     }
     .modal-close:hover { color: var(--text); }
+
+    /* ── Measurement Report modal (เปิดตอนคลิก row ในตาราง Measurements) ──── */
+    tr[data-clickable] { cursor: pointer; }
+    .report-modal-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0;
+      width: 96vw;
+      max-width: 1280px;
+      max-height: 94vh;
+      overflow-y: auto;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+    .report-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .report-header-title { font-size: 1.1rem; font-weight: 700; color: var(--text); }
+    .report-header-sub { font-size: 0.83rem; color: var(--muted); margin-top: 0.25rem; }
+    .report-header-right { display: flex; align-items: center; gap: 0.85rem; }
+    .report-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      padding: 1.5rem;
+    }
+    @media (max-width: 900px) {
+      .report-grid { grid-template-columns: 1fr; }
+    }
+    .report-cell {
+      background: var(--surface2);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+    }
+    .report-image-cell {
+      padding: 0;
+      overflow: hidden;
+      min-height: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #14140f;
+    }
+    .report-image-cell img {
+      width: 100%;
+      height: 100%;
+      max-height: 640px;
+      object-fit: contain;
+      display: block;
+    }
+    .report-image-cell .report-no-image {
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-align: center;
+    }
+    .report-status-cell {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.6rem;
+      min-height: 140px;
+    }
+    .report-status-label {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-weight: 700;
+    }
+    .report-status-value {
+      font-size: 2.6rem;
+      font-weight: 800;
+      letter-spacing: .03em;
+      line-height: 1;
+    }
+    .report-status-value.ok { color: var(--ok); }
+    .report-status-value.ng { color: var(--ng); }
+    .report-section-title {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      margin-bottom: 0.9rem;
+    }
+    .report-section-title .bar { width: 3px; height: 14px; display: inline-block; border-radius: 1px; }
+    .report-specs-cell .report-section-title { color: var(--accent); }
+    .report-specs-cell .report-section-title .bar { background: var(--accent); }
+    .report-dims-cell .report-section-title { color: var(--accent2); }
+    .report-dims-cell .report-section-title .bar { background: var(--accent2); }
+    .report-specs-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.7rem 1.25rem;
+      font-size: 0.85rem;
+    }
+    .report-specs-grid .rs-full { grid-column: 1 / -1; }
+    .report-specs-grid .rs-label { color: var(--muted); font-size: 0.72rem; margin-bottom: 0.15rem; }
+    .report-specs-grid .rs-value { color: var(--text); word-break: break-word; }
+    .report-dims-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    .report-dim-label { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.2rem; }
+    .report-dim-value { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.6rem; }
+    .report-dim-value.x { color: var(--accent); }
+    .report-dim-value.y { color: var(--accent2); }
+    .report-tol-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.6rem 0.75rem;
+      font-size: 0.78rem;
+    }
+    .report-tol-box .tol-row { display: flex; justify-content: space-between; color: var(--muted); }
+    .report-tol-box .tol-row + .tol-row { margin-top: 0.2rem; }
+    .report-close {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 1.4rem;
+      padding: 0.2rem 0.4rem;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .report-close:hover { color: var(--text); }
   </style>
 </head>
 <body>
@@ -723,7 +907,14 @@
     <!-- Section 5 — Measurements Table -->
     <section id="measurements">
       <div class="card">
-        <div class="card-title">Measurements</div>
+        <div class="card-header">
+          <div class="card-title">Measurements <span class="count" id="meas-count"></span></div>
+        </div>
+        <div class="filter-bar">
+          <input type="text" id="meas-search" placeholder="ค้นหาด้วย ALPL Number..." />
+          <input type="date" id="meas-filter-date" title="กรองตาม Timestamp (วันที่)" />
+          <button class="btn-clear-filter" id="meas-clear-filter">✕ Clear Filter</button>
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -743,6 +934,11 @@
             </tbody>
           </table>
         </div>
+        <div class="pagination-bar" style="display:flex;justify-content:flex-end;align-items:center;gap:1rem;margin-top:1rem;">
+          <button type="button" id="btn-meas-prev" class="btn-icon" disabled>‹ Previous</button>
+          <span id="meas-page-info" style="font-size:0.85rem;font-weight:600;color:var(--muted)"></span>
+          <button type="button" id="btn-meas-next" class="btn-icon">Next ›</button>
+        </div>
       </div>
     </section>
 
@@ -754,6 +950,38 @@
   <div class="modal-box">
     <button class="modal-close" id="modal-close" title="Close">✕</button>
     <img id="modal-img" src="" alt="Measurement image" />
+  </div>
+</div>
+
+<!-- Measurement Report modal — เปิดตอนคลิก row ในตาราง Measurements -->
+<div class="modal-overlay" id="report-modal">
+  <div class="report-modal-box">
+    <div class="report-header">
+      <div>
+        <div class="report-header-title" id="report-title">Measurement report</div>
+        <div class="report-header-sub" id="report-subtitle">—</div>
+      </div>
+      <div class="report-header-right">
+        <button class="report-close" id="report-modal-close" title="Close">✕</button>
+      </div>
+    </div>
+    <div class="report-grid">
+      <div class="report-cell report-image-cell" id="report-image-cell">
+        <span class="report-no-image">No image</span>
+      </div>
+      <div class="report-cell">
+        <div class="report-section-title"><span class="bar"></span>Part specifications</div>
+        <div class="report-specs-grid" id="report-specs-grid"></div>
+      </div>
+      <div class="report-cell report-status-cell">
+        <span class="report-status-label">Result</span>
+        <span class="report-status-value" id="report-status-value">—</span>
+      </div>
+      <div class="report-cell report-dims-cell">
+        <div class="report-section-title"><span class="bar"></span>Dimensions and tolerances</div>
+        <div class="report-dims-grid" id="report-dims-grid"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -907,13 +1135,20 @@
 
   let session       = { state: 'idle', session_id: null, measured_count: 0, target_count: 1 };
   let stationStatus = 'connecting';
-  let measurements  = [];
+  let measurements  = [];   // "หน้าปัจจุบัน" ของตาราง Measurements เท่านั้น (server-side pagination — ดู loadMeasurementsPage)
   let parts         = [];
   let sse           = null;
   let ipmQueue      = null;
   let newQueue      = null;
   let lastTelemetry = null;
   let lastImageMeasurementId = null;   // measurement_id ของรูปล่าสุดที่โชว์ใน Camera Preview
+
+  // ── Measurements table: server-side pagination + filter (เหมือน edit.html) ──
+  // เดิมดึงมาแค่ limit=50 ล่าสุด ตอนนี้เปลี่ยนเป็นแบ่งหน้าจริงจาก backend (limit/offset)
+  // พร้อม filter ALPL/วันที่ ที่ backend เอง เพื่อให้ดูย้อนหลังทั้งหมดได้ ไม่ใช่แค่ 50 ตัวล่าสุด
+  let measPage = 1, measTotal = 0, measFilterAlpl = '', measFilterDate = '';
+  let measSearchTimer = null;
+  const MEAS_PAGE_SIZE = 10;
 
   // ── Part Entry / Telemetry persistence ──────────────────────────────────
   // ipmQueue/newQueue/lastTelemetry เดิมอยู่ใน memory ล้วนๆ พอเปลี่ยนหน้า (เช่น
@@ -949,7 +1184,51 @@
     Promise.all([loadSessionState(), loadMeasurements(), loadParts(), loadDropdownData()])
       .then(() => connectSSE());
     initPartEntry();
+    bindMeasurementFilters();
   });
+
+  // ── Measurements filter/pagination bindings — เหมือน edit.html ─────────────
+  //    meas-search → number_alpl (debounce ~300ms กัน fetch รัวตอนพิมพ์)
+  //    meas-filter-date → date_from/date_to (ทั้งวัน) เลือกทีเดียวไม่ต้อง debounce
+  //    ทั้งคู่ reset measPage = 1 ก่อน refetch เสมอ
+  function bindMeasurementFilters() {
+    document.getElementById('meas-search').addEventListener('input', (e) => {
+      clearTimeout(measSearchTimer);
+      measSearchTimer = setTimeout(async () => {
+        measFilterAlpl = e.target.value.trim();
+        measPage = 1;
+        await loadMeasurementsPage();
+        renderTable();
+      }, 300);
+    });
+    document.getElementById('meas-filter-date').addEventListener('input', async (e) => {
+      measFilterDate = e.target.value;
+      measPage = 1;
+      await loadMeasurementsPage();
+      renderTable();
+    });
+    document.getElementById('meas-clear-filter').onclick = async () => {
+      clearTimeout(measSearchTimer);
+      document.getElementById('meas-search').value = '';
+      document.getElementById('meas-filter-date').value = '';
+      measFilterAlpl = ''; measFilterDate = '';
+      measPage = 1;
+      await loadMeasurementsPage();
+      renderTable();
+    };
+    document.getElementById('btn-meas-prev').onclick = async () => {
+      if (measPage <= 1) return;
+      measPage--;
+      await loadMeasurementsPage();
+      renderTable();
+    };
+    document.getElementById('btn-meas-next').onclick = async () => {
+      if ((measPage - 1) * MEAS_PAGE_SIZE + measurements.length >= measTotal) return;
+      measPage++;
+      await loadMeasurementsPage();
+      renderTable();
+    };
+  }
 
   // ── Dropdown data (Operator/Owner/Vendor/Handler/Category/Package Size) ──
   // dropdown ทุกตัวเป็นแบบปิด — โหลดจาก DB ครั้งเดียวตอนเปิดหน้า แล้วเติมลง
@@ -1072,21 +1351,17 @@
     try { return JSON.parse(e.data); } catch { return {}; }
   }
 
-  function onNewMeasurement(d) {
-    measurements.unshift({
-      measurement_id: d.measurement_id,
-      session_id:     d.session_id,
-      number_alpl:    d.number_alpl,
-      value_x:        d.value_x,
-      value_y:        d.value_y,
-      result:         d.result,
-      image_path:     null,
-      timestamp:      new Date().toISOString(),
-    });
+  async function onNewMeasurement(d) {
     updateSession({ measured_count: d.measured, target_count: d.target });
-    renderTable(d.measurement_id);
-    updateStats();
     updateTelemetry(d);
+    updateStats();
+    // ตารางตอนนี้แบ่งหน้า/กรองแบบ server-side แล้ว — แถวใหม่จะโผล่ "สด" เฉพาะตอนที่
+    // ผู้ใช้กำลังดูหน้า 1 แบบไม่มี filter ค้างอยู่เท่านั้น (ตรงกับตำแหน่งที่มันจะโผล่จริง
+    // ถ้า sort ล่าสุดก่อน) ถ้ากำลังดูหน้าอื่น/มี filter ค้างอยู่ ไม่ไปรบกวนสิ่งที่ผู้ใช้ดูอยู่
+    if (measPage === 1 && !measFilterAlpl && !measFilterDate) {
+      await loadMeasurementsPage();
+      renderTable(d.measurement_id);
+    }
   }
 
   function updateTelemetry(d) {
@@ -1711,27 +1986,61 @@
     setTimeout(() => { statusEl.textContent = ''; }, 4000);
   }
 
-  // ── Measurements ──────────────────────────────────────────────────────────
-  async function loadMeasurements() {
+  // ── Measurements — server-side pagination + filter (ALPL / วันที่) ──────────
+  // ดึงทีละหน้า (limit/offset) จาก backend พร้อม filter เดียวกับตาราง Measurements
+  // ใน edit.html แทนที่จะดึงมาแค่ 50 ตัวล่าสุดคงที่ — ทำให้ดูย้อนหลังทั้งหมดได้ผ่าน
+  // Next/Previous backend คืน {items, total} — items คือ "หน้าปัจจุบัน", total คือ
+  // จำนวนแถวทั้งหมดที่ตรงกับ filter (ใช้คำนวณเปิด/ปิดปุ่ม Next)
+  async function loadMeasurementsPage() {
+    const offset = (measPage - 1) * MEAS_PAGE_SIZE;
+    const params = new URLSearchParams({ limit: MEAS_PAGE_SIZE, offset });
+    if (measFilterAlpl) params.set('number_alpl', measFilterAlpl);
+    if (measFilterDate) {
+      params.set('date_from', `${measFilterDate} 00:00:00`);
+      params.set('date_to',   `${measFilterDate} 23:59:59`);
+    }
     try {
-      // /api/measurements เปลี่ยน shape เป็น {items, total} แล้ว — ดึง 50 รายการ
-      // ล่าสุดมาแสดงบน dashboard (พอสำหรับ stats ของ session ปัจจุบัน) อ่านจาก .items
-      const r = await fetch(`${API}/api/measurements?limit=50`);
-      if (r.ok) { const d = await r.json(); measurements = d.items ?? []; }
-    } catch (e) { console.warn('loadMeasurements:', e); }
+      const r = await fetch(`${API}/api/measurements?${params}`);
+      if (r.ok) {
+        const d = await r.json();
+        measurements = d.items ?? [];
+        measTotal    = d.total ?? 0;
+      }
+    } catch (e) { console.warn('loadMeasurementsPage:', e); }
+  }
+
+  async function loadMeasurements() {
+    await loadMeasurementsPage();
     renderTable();
     updateStats();
   }
 
   function imgBtn(id) {
-    return `<button class="img-btn-inner" onclick="showImage(${id})">🖼</button>`;
+    return `<button class="img-btn-inner" title="View report" onclick="event.stopPropagation(); openReportModal(${id})"></button>`;
+  }
+
+  function measPageInfoText() {
+    if (measTotal === 0) return 'ไม่มีรายการ';
+    const start = (measPage - 1) * MEAS_PAGE_SIZE + 1;
+    const end   = (measPage - 1) * MEAS_PAGE_SIZE + measurements.length;
+    return `แสดง ${start}–${end} จาก ${measTotal} รายการ`;
+  }
+
+  function renderMeasPagination() {
+    document.getElementById('meas-count').textContent = `(${measTotal})`;
+    document.getElementById('meas-page-info').textContent = measPageInfoText();
+    document.getElementById('btn-meas-prev').disabled = measPage <= 1;
+    document.getElementById('btn-meas-next').disabled =
+      (measPage - 1) * MEAS_PAGE_SIZE + measurements.length >= measTotal;
   }
 
   function renderTable(highlightId = null) {
     const rows = measurements;
     const tbody = document.getElementById('meas-body');
+    renderMeasPagination();
     if (!rows.length) {
-      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:2rem">No measurements</td></tr>`;
+      const msg = (measFilterAlpl || measFilterDate) ? 'ไม่พบ Measurement ที่ตรงกับตัวกรอง' : 'No measurements';
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="8">${msg}</td></tr>`;
       return;
     }
     tbody.innerHTML = rows.map(m => {
@@ -1739,7 +2048,7 @@
       const res = m.result || '—';
       const cls = res === 'OK' ? 'ok' : res === 'NG' ? 'ng' : '';
       const hl  = m.measurement_id === highlightId ? 'highlight-new' : '';
-      return `<tr data-id="${m.measurement_id}" class="${hl}">
+      return `<tr data-id="${m.measurement_id}" data-clickable class="${hl}" onclick="openReportModal(${m.measurement_id})">
         <td>${m.measurement_id}</td>
         <td>${m.session_id ?? '—'}</td>
         <td>${m.number_alpl}</td>
@@ -1752,16 +2061,27 @@
     }).join('');
   }
 
-  function updateStats() {
-    const currentSessionId = session.session_id;
-    const rows = currentSessionId == null
-      ? []
-      : measurements.filter(m => m.session_id === currentSessionId);
-    const ok = rows.filter(m => m.result === 'OK').length;
-    const ng = rows.filter(m => m.result === 'NG').length;
-    document.getElementById('stat-total').textContent = rows.length;
-    document.getElementById('stat-ok').textContent    = ok;
-    document.getElementById('stat-ng').textContent    = ng;
+  // Stats cards (Total/OK/NG) ต้องนับจาก "ทุก" measurement ของ session ปัจจุบัน ไม่ใช่
+  // แค่หน้าที่กำลังแสดงในตาราง (ตอนนี้ตารางแบ่งหน้าแค่ทีละ 10 แถวแล้ว) จึงยิง request
+  // แยกไปนับที่ backend ตรงๆ ผ่าน total ของแต่ละ filter (limit=1 พอ เพราะสนใจแค่ total)
+  async function updateStats() {
+    const sid = session.session_id;
+    if (sid == null) {
+      document.getElementById('stat-total').textContent = 0;
+      document.getElementById('stat-ok').textContent    = 0;
+      document.getElementById('stat-ng').textContent    = 0;
+      return;
+    }
+    try {
+      const [totalD, okD, ngD] = await Promise.all([
+        fetch(`${API}/api/measurements?session_id=${sid}&limit=1`).then(r => r.ok ? r.json() : { total: 0 }),
+        fetch(`${API}/api/measurements?session_id=${sid}&result=OK&limit=1`).then(r => r.ok ? r.json() : { total: 0 }),
+        fetch(`${API}/api/measurements?session_id=${sid}&result=NG&limit=1`).then(r => r.ok ? r.json() : { total: 0 }),
+      ]);
+      document.getElementById('stat-total').textContent = totalD.total ?? 0;
+      document.getElementById('stat-ok').textContent    = okD.total ?? 0;
+      document.getElementById('stat-ng').textContent    = ngD.total ?? 0;
+    } catch (e) { console.warn('updateStats:', e); }
   }
 
   async function loadParts() {
@@ -1788,6 +2108,100 @@
   function closeModal() {
     document.getElementById('modal').classList.remove('open');
     document.getElementById('modal-img').src = '';
+  }
+
+  // ── Measurement Report modal ─────────────────────────────────────────────
+  // เปิดตอนคลิก row ในตาราง Measurements — รวมข้อมูล measurement + part (join
+  // ด้วย number_alpl จาก `parts` ที่โหลดไว้แล้ว) มาแสดงในหน้าต่างเดียว
+  function findPartByAlpl(numberAlpl) {
+    return parts.find(p => p.number_alpl === numberAlpl) || null;
+  }
+
+  async function openReportModal(measurementId) {
+    const m = measurements.find(x => x.measurement_id === measurementId);
+    if (!m) return;
+    const part = findPartByAlpl(m.number_alpl);
+
+    document.getElementById('report-title').textContent = `Measurement report — ALPL ${m.number_alpl}`;
+    const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : '—';
+    const sessionText = m.session_id != null ? `Session #${m.session_id}` : 'Session —';
+    const opText = m.operator_name || '—';
+    document.getElementById('report-subtitle').textContent = `${ts} · ${sessionText} · ${opText}`;
+
+    const res = m.result || '—';
+    const resCls = res === 'OK' ? 'ok' : res === 'NG' ? 'ng' : '';
+    const statusVal = document.getElementById('report-status-value');
+    statusVal.textContent = res;
+    statusVal.className = `report-status-value ${resCls}`;
+
+    // Part specifications — โชว์ทุกคอลัมน์ของ Part ที่เกี่ยวข้องกับ ALPL นี้
+    const specsGrid = document.getElementById('report-specs-grid');
+    const specRows = [
+      ['Part number',  part?.part_number  || '—'],
+      ['Handler',      part?.handler      || '—'],
+      ['Vendor',       part?.vendor       || '—'],
+      ['Category',     part?.category     || '—'],
+      ['Package size', part?.package_size || '—'],
+      ['Owner',        part?.owner        || '—'],
+      ['PO number',    part?.po_number != null ? part.po_number : '—'],
+      ['Template',     part?.template_name || '—'],
+    ];
+    specsGrid.innerHTML = specRows.map(([label, value]) =>
+      `<div><div class="rs-label">${label}</div><div class="rs-value">${value}</div></div>`
+    ).join('') + `<div class="rs-full"><div class="rs-label">Description</div><div class="rs-value">${part?.description || '—'}</div></div>`;
+
+    // Dimensions & tolerances — upper_tol/lower_tol เป็นค่าเดียวใช้ร่วมกันทั้งแกน
+    // X/Y ตาม schema package_size ปัจจุบัน (ดู PARTS_SELECT ใน main.py) กล่อง
+    // Upper/Lower โชว์เป็นค่าขอบเขตจริง (nominal ± tol) ไม่ใช่ค่า delta ดิบ
+    const dimsGrid = document.getElementById('report-dims-grid');
+    const fmt = v => v != null && !isNaN(v) ? Number(v).toFixed(3) : '—';
+    const nomX = part?.nominal_x, nomY = part?.nominal_y;
+    const upTol = part?.upper_tol, loTol = part?.lower_tol;
+    const bound = (nom, tol, sign) => (nom != null && tol != null) ? fmt(Number(nom) + sign * Number(tol)) : '—';
+    dimsGrid.innerHTML = `
+      <div>
+        <div class="report-dim-label">Actual X${nomX != null ? ` · nom ${fmt(nomX)}` : ''}</div>
+        <div class="report-dim-value x">${fmt(m.value_x)} mm</div>
+        <div class="report-tol-box">
+          <div class="tol-row"><span>Upper</span><span>${bound(nomX, upTol, 1)}</span></div>
+          <div class="tol-row"><span>Lower</span><span>${bound(nomX, loTol, -1)}</span></div>
+        </div>
+      </div>
+      <div>
+        <div class="report-dim-label">Actual Y${nomY != null ? ` · nom ${fmt(nomY)}` : ''}</div>
+        <div class="report-dim-value y">${fmt(m.value_y)} mm</div>
+        <div class="report-tol-box">
+          <div class="tol-row"><span>Upper</span><span>${bound(nomY, upTol, 1)}</span></div>
+          <div class="tol-row"><span>Lower</span><span>${bound(nomY, loTol, -1)}</span></div>
+        </div>
+      </div>`;
+
+    // รูปภาพ — ขอ presigned URL สดใหม่เสมอ (เหมือน showImage) ไม่มีรูปก็โชว์ placeholder
+    const imageCell = document.getElementById('report-image-cell');
+    imageCell.innerHTML = '<span class="report-no-image">Loading…</span>';
+    if (m.image_path) {
+      try {
+        const r = await fetch(`${API}/api/image-url/${measurementId}`);
+        if (r.ok) {
+          const data = await r.json();
+          imageCell.innerHTML = `<img src="${data.url}" alt="Measurement #${measurementId} image" />`;
+        } else {
+          imageCell.innerHTML = '<span class="report-no-image">No image</span>';
+        }
+      } catch (e) {
+        imageCell.innerHTML = '<span class="report-no-image">No image</span>';
+      }
+    } else {
+      imageCell.innerHTML = '<span class="report-no-image">No image</span>';
+    }
+
+    document.getElementById('report-modal').classList.add('open');
+  }
+
+  document.getElementById('report-modal-close').onclick = closeReportModal;
+  document.getElementById('report-modal').onclick = e => { if (e.target.id === 'report-modal') closeReportModal(); };
+  function closeReportModal() {
+    document.getElementById('report-modal').classList.remove('open');
   }
 </script>
 </body>

@@ -431,7 +431,6 @@
   <section class="card" id="measurements-section">
     <div class="card-header">
       <div class="card-title">Measurements <span class="count" id="meas-count"></span></div>
-      <button class="btn-add" id="btn-add-meas">+ Add Measurement</button>
     </div>
 
     <div class="filter-bar">
@@ -761,6 +760,11 @@
     // modal) เสมอเมื่อเปิดจากฝั่ง Part ส่วน measurement modal ยังเปิด/ผูกปุ่มเองตามเดิม
     document.getElementById('btn-delete-inline').style.display = 'none';
 
+    // Add: บังคับกรอกทุก field เหมือนโหมด New ของ Part Entry (index.html) —
+    // Edit: บังคับกรอกแค่ ALPL เท่านั้น field อื่นแก้บางส่วนได้โดยไม่ต้องกรอกครบ
+    // (หมายเหตุ: ถ้าเว้นว่าง field ที่เคยมีค่าไว้ตอน Edit แล้ว Save ค่านั้นจะถูก
+    // เคลียร์เป็นว่างจริงๆ ไม่ใช่ "คงค่าเดิมไว้" — record ที่ส่งไปเป็นก้อนเต็มเสมอ)
+    const req = mode === 'add' ? '<span class="req">*</span>' : '';
     document.getElementById('edit-form-grid').innerHTML = `
       <div class="form-group">
         <label for="f-number_alpl">ALPL <span class="req">*</span></label>
@@ -768,42 +772,42 @@
         <div class="field-error" id="err-f-number_alpl">${mode === 'edit' ? '<span class="field-locked-note">แก้ ALPL ได้ — ระวัง: ถ้า ALPL นี้มีประวัติ session/measurement ผูกอยู่แล้ว การเปลี่ยนจะถูก DB ปฏิเสธ (FK constraint)</span>' : ''}</div>
       </div>
       <div class="form-group">
-        <label for="f-part_number">Part Number <span class="req">*</span></label>
+        <label for="f-part_number">Part Number ${req}</label>
         <input type="text" id="f-part_number" value="${v('part_number')}" />
         <div class="field-error" id="err-f-part_number"></div>
       </div>
       <div class="form-group">
-        <label for="f-handler">Handler</label>
+        <label for="f-handler">Handler ${req}</label>
         <select id="f-handler">${buildOptions(handlerOptions, v('handler'))}</select>
         <div class="field-error" id="err-f-handler"></div>
       </div>
       <div class="form-group">
-        <label for="f-vendor">Vendor</label>
+        <label for="f-vendor">Vendor ${req}</label>
         <select id="f-vendor">${buildOptions(vendorOptions, v('vendor'))}</select>
         <div class="field-error" id="err-f-vendor"></div>
       </div>
       <div class="form-group span-2">
-        <label for="f-description">Description</label>
+        <label for="f-description">Description ${req}</label>
         <input type="text" id="f-description" value="${v('description')}" />
         <div class="field-error" id="err-f-description"></div>
       </div>
       <div class="form-group">
-        <label for="f-po_number">PO Number</label>
+        <label for="f-po_number">PO Number ${req}</label>
         <input type="number" id="f-po_number" value="${v('po_number')}" />
         <div class="field-error" id="err-f-po_number"></div>
       </div>
       <div class="form-group">
-        <label for="f-category">Category</label>
+        <label for="f-category">Category ${req}</label>
         <select id="f-category">${buildOptions(categoryOptions, v('category'))}</select>
         <div class="field-error" id="err-f-category"></div>
       </div>
       <div class="form-group">
-        <label for="f-package_size">Package Size <span class="req">*</span></label>
+        <label for="f-package_size">Package Size ${req}</label>
         <input type="text" id="f-package_size" list="package-size-datalist" value="${v('package_size')}" placeholder="เลือก package size — map nominal/tolerance/template ให้อัตโนมัติ" />
         <div class="field-error" id="err-f-package_size"></div>
       </div>
       <div class="form-group">
-        <label for="f-owner">Owner</label>
+        <label for="f-owner">Owner ${req}</label>
         <select id="f-owner">${buildOptions(ownerOptions, v('owner'))}</select>
         <div class="field-error" id="err-f-owner"></div>
       </div>
@@ -830,12 +834,23 @@
       setFieldError('number_alpl', `ALPL ${nAlpl} มีอยู่ในตารางแล้ว`);
       hasError = true;
     }
-    if (!partNumber) { setFieldError('part_number', 'กรอก Part Number'); hasError = true; }
-    if (!val('package_size')) {
-      // package_size เป็นตัวกำหนด nominal/tolerance/template ของ part ทั้งหมด
-      // (ผ่าน package_size lookup table) จึงบังคับกรอกเสมอ
-      setFieldError('package_size', 'กรอก Package Size (จะ map nominal/tolerance/template ให้อัตโนมัติ)');
-      hasError = true;
+    // field อื่นๆ นอกจาก ALPL บังคับกรอกเฉพาะตอน Add เท่านั้น — ตอน Edit ปล่อย
+    // ว่างได้หมด (ตามที่เลือกไว้ว่า Edit บังคับแค่ ALPL) ส่วน Add ยังบังคับกรอก
+    // ครบทุก field เหมือนเดิม
+    if (editContext.mode === 'add') {
+      if (!partNumber) { setFieldError('part_number', 'กรอก Part Number'); hasError = true; }
+      if (!val('handler'))     { setFieldError('handler', 'เลือก Handler'); hasError = true; }
+      if (!val('vendor'))      { setFieldError('vendor', 'เลือก Vendor'); hasError = true; }
+      if (!val('description')) { setFieldError('description', 'กรอก Description'); hasError = true; }
+      if (!val('po_number'))   { setFieldError('po_number', 'กรอก PO Number'); hasError = true; }
+      if (!val('category'))    { setFieldError('category', 'เลือก Category'); hasError = true; }
+      if (!val('package_size')) {
+        // package_size เป็นตัวกำหนด nominal/tolerance/template ของ part ทั้งหมด
+        // (ผ่าน package_size lookup table) จึงบังคับกรอกเสมอตอน Add
+        setFieldError('package_size', 'กรอก Package Size (จะ map nominal/tolerance/template ให้อัตโนมัติ)');
+        hasError = true;
+      }
+      if (!val('owner'))       { setFieldError('owner', 'เลือก Owner'); hasError = true; }
     }
     if (hasError) return;
 
@@ -980,6 +995,7 @@
         <input type="number" id="f-number_alpl" value="${v('number_alpl')}" />
         <div class="field-error" id="err-f-number_alpl">${isEdit ? '<span class="field-locked-note">แก้ ALPL ได้ — ใช้กรณี IPM เลือกชิ้นที่มีอยู่จริงผิดตัว (ต้องเป็น ALPL ที่ลงทะเบียนใน Parts แล้ว)</span>' : ''}</div>
       </div>
+      ${isEdit ? '' : `
       <div class="form-group">
         <label for="f-value_x">Value X (mm) <span class="req">*</span></label>
         <input type="number" step="0.001" id="f-value_x" value="${v('value_x')}" />
@@ -990,6 +1006,7 @@
         <input type="number" step="0.001" id="f-value_y" value="${v('value_y')}" />
         <div class="field-error" id="err-f-value_y"></div>
       </div>
+      `}
       <div class="form-group span-2">
         <label for="f-note">Note</label>
         <textarea id="f-note">${v('note') ?? ''}</textarea>
@@ -1024,30 +1041,34 @@
       sessionId = existing.session_id;
     }
 
-    const valueXRaw = val('value_x'), valueYRaw = val('value_y');
-    if (valueXRaw === '' || isNaN(Number(valueXRaw))) { setFieldError('value_x', 'กรอก Value X เป็นตัวเลข'); hasError = true; }
-    if (valueYRaw === '' || isNaN(Number(valueYRaw))) { setFieldError('value_y', 'กรอก Value Y เป็นตัวเลข'); hasError = true; }
+    // Value X/Y แก้ไม่ได้แล้วตอน Edit (เอาช่องออกจากฟอร์มไปเลย — ดู
+    // openMeasModal) เหลือแก้ได้แค่ ALPL/Note เท่านั้น ค่า value_x/value_y เดิม
+    // จะไม่ถูกแตะต้องเลย (ไม่ส่งไปใน payload — backend ใช้ whitelist อยู่แล้ว
+    // ไม่ส่ง field ไหนก็แค่ไม่อัปเดต field นั้น) โหมด Add ยังกรอก value_x/y ได้
+    // ตามปกติ (แม้ตอนนี้จะไม่มีปุ่มเปิดโหมด Add จาก UI แล้วก็ตาม)
+    let valueXRaw, valueYRaw;
+    if (!isEdit) {
+      valueXRaw = val('value_x'); valueYRaw = val('value_y');
+      if (valueXRaw === '' || isNaN(Number(valueXRaw))) { setFieldError('value_x', 'กรอก Value X เป็นตัวเลข'); hasError = true; }
+      if (valueYRaw === '' || isNaN(Number(valueYRaw))) { setFieldError('value_y', 'กรอก Value Y เป็นตัวเลข'); hasError = true; }
+    }
     if (hasError) return;
 
     const note = val('note') || null;
 
     // ไม่ส่ง result แล้ว — backend คำนวณ OK/NG ใหม่เองเสมอจาก value_x/value_y/number_alpl
     // เทียบกับ tolerance ของ package_size (ดู update_measurement / create_measurement)
-    const payload = {
-      session_id: sessionId,
-      number_alpl: numberAlpl,
-      value_x: Number(valueXRaw),
-      value_y: Number(valueYRaw),
-      note: note
-    };
+    const payload = isEdit
+      ? { session_id: sessionId, number_alpl: numberAlpl, note: note }
+      : { session_id: sessionId, number_alpl: numberAlpl, value_x: Number(valueXRaw), value_y: Number(valueYRaw), note: note };
 
     // ถ้าเป็นโหมด Edit และไม่มี field ไหนเปลี่ยนจากค่าเดิมเลย ให้ปิด modal เฉยๆ
-    // ไม่ต้องยิง API (เทียบเฉพาะ field ที่แก้ได้จริงในฟอร์ม ไม่รวม session_id ที่
-    // ไม่ได้ให้แก้อยู่แล้ว) — กัน toast "Measurement not found" หลอกๆ ตอน Save
-    // ทั้งที่ไม่ได้แก้อะไร
+    // ไม่ต้องยิง API (เทียบเฉพาะ field ที่แก้ได้จริงในฟอร์ม — Edit เหลือแค่
+    // number_alpl/note เพราะ value_x/y แก้ไม่ได้แล้ว) — กัน toast
+    // "Measurement not found" หลอกๆ ตอน Save ทั้งที่ไม่ได้แก้อะไร
     if (isEdit && editContext.original) {
       const orig = editContext.original;
-      const editableFields = ['number_alpl', 'value_x', 'value_y', 'note'];
+      const editableFields = ['number_alpl', 'note'];
       const changed = editableFields.some(
         k => String(orig[k] ?? null) !== String(payload[k] ?? null)
       );
@@ -1231,7 +1252,6 @@
     };
 
     document.getElementById('btn-add-part').onclick = () => openPartModal('add');
-    document.getElementById('btn-add-meas').onclick = () => openMeasModal('add');
 
     document.getElementById('edit-form').addEventListener('submit', ev => {
       ev.preventDefault();

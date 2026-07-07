@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from minio import Minio
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -56,9 +57,6 @@ MINIO_BUCKET    = "tmx-images"
 
 AGENT_PORT      = int(os.getenv("AGENT_PORT", 9998))
 AGENT_BASE_URL  = f"http://localhost:{AGENT_PORT}"
-
-HB_TIMEOUT      = int(os.getenv("HEARTBEAT_TIMEOUT",  15))
-HB_INTERVAL     = int(os.getenv("HEARTBEAT_INTERVAL",  5))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [Server] %(message)s")
 log = logging.getLogger(__name__)
@@ -135,41 +133,6 @@ def ensure_bucket() -> None:
         log.info("Created MinIO bucket: %s", MINIO_BUCKET)
 
 
-# ── Background heartbeat checker ─────────────────────────────────────────────
-async def heartbeat_checker() -> None:
-    """Loop พื้นหลังที่ตรวจจับสถานี (station) ที่หยุดส่ง heartbeat มา
-
-    ทำไมต้องมี: Agent ควรจะ ping มาที่ /api/heartbeat เป็นระยะระหว่าง session กำลังรัน
-    ถ้าสถานีดับ ไฟตัด หรือสาย TCP/Serial หลุด มันจะหยุด ping — แต่ใน DB จะยังบอกว่า
-    state='running' ตลอดไปถ้าไม่มีใครมาเช็ค loop นี้รันทุก HB_INTERVAL วินาที หา session
-    ที่ state='running' แต่ last_seen เก่ากว่า HB_TIMEOUT แล้วเปลี่ยนเป็น 'timeout'
-    พร้อม broadcast ผ่าน SSE เพื่อให้ dashboard แสดงสถานีเป็น offline แทนที่จะรอเงียบๆ
-    """
-    while True:
-        await asyncio.sleep(HB_INTERVAL)
-        try:
-            db = get_db()
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT session_id FROM sessions "
-                    "WHERE state = 'running' "
-                    "AND last_seen < DATE_SUB(NOW(), INTERVAL %s SECOND)",
-                    (HB_TIMEOUT,),
-                )
-                rows = cur.fetchall()
-            for row in rows:
-                sid = row["session_id"]
-                with db.cursor() as cur:
-                    cur.execute(
-                        "UPDATE sessions SET state = 'timeout' WHERE session_id = %s", (sid,)
-                    )
-                log.warning("Session %s timed out", sid)
-                await push_event("session_timeout", {"session_id": sid})
-            db.close()
-        except Exception as exc:
-            log.error("Heartbeat checker error: %s", exc)
-
-
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 async def _init_bucket_bg() -> None:
     """พยายามสร้าง MinIO bucket แบบ background — ไม่ block การ startup ของแอป
@@ -186,18 +149,64 @@ async def _init_bucket_bg() -> None:
         log.warning("MinIO init failed (not fatal): %s", exc)
 
 
+async def _reload_session_queues() -> None:
+    """โหลด session_queues กลับเข้า memory จากคอลัมน์ sessions.queue_state
+
+    ทำไมต้องมี: session_queues เดิมอยู่ใน memory ของ backend ล้วนๆ ถ้า backend
+    ถูก restart (reload ตอน dev, crash แล้ว auto-restart, deploy ใหม่) ระหว่างที่
+    มี session แบบ IPM/New กำลัง running อยู่ คิวจะหายไปจาก memory ทันที —
+    create_measurement หลังจากนั้นจะ fallback ไปใช้ req.number_alpl ที่ Agent
+    ส่งมา ซึ่งเป็น ALPL ตัวแรกในคิวเสมอ (Agent ไม่เคยอัปเดตค่านี้เอง) ทำให้ทุก
+    measurement ที่เหลือถูกบันทึกผิด ALPL ไปเรื่อยๆ แบบไม่มี error เตือนเลย
+
+    จึงต้องรันตรงนี้ (ก่อน yield ให้แอปเริ่มรับ request) — ต้อง await ตรงๆ ไม่ใช่
+    fire-and-forget แบบ _init_bucket_bg เพราะต้องมั่นใจว่า session_queues ถูก
+    เติมกลับให้ครบก่อนที่ request แรกจาก Agent จะเข้ามาได้
+    """
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id, queue_state FROM sessions "
+                    "WHERE state = 'running' AND queue_state IS NOT NULL"
+                )
+                rows = cur.fetchall()
+        finally:
+            db.close()
+
+        for row in rows:
+            try:
+                session_queues[row["session_id"]] = json.loads(row["queue_state"])
+                log.info("Restored queue_state for session %s from DB", row["session_id"])
+            except Exception as exc:
+                log.warning("Failed to parse queue_state for session %s: %s", row["session_id"], exc)
+    except Exception as exc:
+        # DB อาจยังไม่พร้อมตอน boot — อย่าทำให้แอปบูตไม่ขึ้นเพราะเรื่องนี้ แค่
+        # log ไว้ (session ที่ running อยู่ตอน restart แบบนี้จะพลาดการกู้คืนคิว
+        # แต่ยังใช้งานต่อได้ปกติถ้าไม่ใช่ queue-based หรือกด Stop แล้วเริ่มใหม่)
+        log.warning("Reload session_queues failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Hook ตอน FastAPI เริ่มทำงาน (startup) และตอนปิด (shutdown)
 
-    ทำไม: ตรงนี้คือจุดที่ background task ทั้ง 2 ตัว (สร้าง MinIO bucket และ
-    heartbeat checker) ถูกสั่งให้เริ่มทำงานตอนแอป boot และถูก cancel อย่างถูกต้อง
-    ตอนแอป shutdown แทนที่จะไปสั่งเริ่มภายใน request handler
+    ทำไม: ตรงนี้คือจุดที่ background task (สร้าง MinIO bucket) ถูกสั่งให้เริ่ม
+    ทำงานตอนแอป boot แทนที่จะไปสั่งเริ่มภายใน request handler ส่วน
+    _reload_session_queues() ต้อง await ให้เสร็จก่อน yield เพราะต้องกู้คืนคิว
+    ให้ครบก่อนรับ request
+
+    หมายเหตุ: เดิมมี heartbeat_checker() คู่กันด้วย (ตรวจ Agent เงียบหายกลาง
+    session แล้ว mark เป็น 'timeout') — เอาออกแล้วเพราะ Agent/Backend/Web รันอยู่
+    บน Pi เครื่องเดียวกันหมด (localhost) ค่าที่มันเคยป้องกัน (network/สถานีหลุด
+    ระหว่างเครื่อง) ไม่ค่อยมีความหมายแล้ว ยอมรับความเสี่ยงที่เหลืออยู่ (ถ้า Agent
+    process ตาย/แฮงค์กลาง session ตัว session จะค้างเป็น 'running' ตลอดไปจนกว่า
+    จะกด Stop เองจาก dashboard) ตามที่ตกลงกันไว้
     """
     asyncio.create_task(_init_bucket_bg())       # fire-and-forget, never blocks
-    task = asyncio.create_task(heartbeat_checker())
+    await _reload_session_queues()               # ต้องเสร็จก่อนรับ request
     yield
-    task.cancel()
 
 
 app = FastAPI(title="TM-X Backend Server", lifespan=lifespan)
@@ -247,10 +256,6 @@ async def sse_stream(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 class StopSessionRequest(BaseModel):
     session_id: int
-
-
-class HeartbeatRequest(BaseModel):
-    session_id: Optional[int] = None
 
 
 @app.get("/api/session/state")
@@ -329,7 +334,7 @@ async def _notify_agent_start(
 
     ครอบด้วย try/except เพราะถ้า Agent ไม่ได้รันอยู่ (หรือตอบช้าเกิน timeout)
     httpx จะ raise exception ที่ FastAPI ไม่รู้จัก (ConnectError/TimeoutException)
-    — ถ้าปล่อยให้ exception นี้หลุดออกไปจาก endpoint โดยไม่ catch จะกลายเป็น
+    — ถ้าปล่อยให้ exception นี้หลุดออกไปจากเอนด์พอยต์โดยไม่ catch จะกลายเป็น
     unhandled exception (500) ที่บางครั้งไม่มี CORS header แนบมาด้วย ทำให้
     browser เข้าใจผิดว่าเป็น CORS error ทั้งที่จริงๆคือ Agent ไม่ตอบ — log
     warning ไว้เฉยๆ แล้วให้ session ใน DB ยัง 'running' ต่อไปได้ (เหมือนที่
@@ -378,6 +383,11 @@ async def start_session(request: Request):
     (action/session_id/template_name/target_count/number_alpl ตัวแรก) ส่วน
     การ map ALPL ตัวต่อๆไปในคิวเข้ากับ measurement ที่จะตามมา เป็นเรื่องที่
     backend จัดการเองทั้งหมดผ่าน session_queues (ดู create_measurement)
+
+    หมายเหตุ (เพิ่มเข้ามาทีหลัง): Race condition ตอนกด Start ซ้ำเร็วๆ — ครอบ
+    check+insert ด้วย MySQL GET_LOCK/RELEASE_LOCK กันสอง request แข่งกันผ่าน
+    Button Guard พร้อมกันได้ (เดิมเช็คแล้ว insert คนละคำสั่ง ไม่มีอะไรล็อก
+    ระหว่างนั้นเลย)
     """
     data = await request.json()
     log.info("📥 ได้รับ payload จาก /api/session/start:\n%s", json.dumps(data, ensure_ascii=False, indent=2))
@@ -405,48 +415,61 @@ async def start_session(request: Request):
 
     db = get_db()
     try:
+        # GET_LOCK ครอบทั้ง Button Guard + insert — ให้ทั้งสองเป็น atomic
+        # section เดียวกันจริงๆ ในระดับ DB (ไม่ใช่แค่ระดับ Python) กันสอง
+        # request "Start" ที่มาถึงพร้อมกันเป๊ะๆ ผ่าน check ทั้งคู่ก่อนจะมีใคร
+        # insert ทัน — timeout 5 วิ พอสำหรับ critical section สั้นๆ นี้
         with db.cursor() as cur:
-            # Button Guard — กันรัน 2 session ซ้อนกัน (เหมือนของเดิมก่อนหน้านี้)
-            cur.execute("SELECT session_id FROM sessions WHERE state = 'running'")
-            if cur.fetchone():
-                raise HTTPException(400, "A session is already running")
+            cur.execute("SELECT GET_LOCK('tmx_start_session', 5) AS got")
+            if not cur.fetchone()["got"]:
+                raise HTTPException(503, "ระบบกำลังประมวลผลคำสั่ง Start อื่นอยู่ ลองใหม่อีกครั้ง")
 
-            if measure_type == "New":
-                # 1) Insert Part เฉพาะ "ตัวแรก" ในคิวก่อน (ต้องมาก่อน insert
-                # session เพราะ FK — sessions.number_alpl ต้องมี Part อยู่จริง
-                # ก่อนถึงจะ insert ได้) ส่วน ALPL ตัวที่เหลือในคิวจะถูก insert
-                # ทีละตัว "ตอนได้ผลวัดจริง" ใน create_measurement แทน ไม่ insert
-                # รวดเดียวทั้งคิวแบบเดิม — กันกรณีกด Stop กลางคันแล้วมี Part ที่
-                # ไม่เคยวัดจริงค้างอยู่ใน DB
-                #
-                # ครอบ try/except เพราะ MySQL อาจ throw error ได้หลายแบบตอน
-                # insert (ALPL ซ้ำ, ข้อมูลผิด type, ค่ายาวเกิน column ฯลฯ) —
-                # จับ pymysql.MySQLError (base class ของ error ทุกชนิดจาก MySQL)
-                # ไม่ใช่แค่ IntegrityError ตัวเดียว เพื่อกัน raw exception หลุด
-                # ออกไปทำให้ response 500 ไม่มี CORS header แนบมา
-                try:
-                    _insert_part_row(cur, first_alpl, data)
-                except pymysql.MySQLError as exc:
-                    raise HTTPException(409, f"Insert Part แรกในคิวไม่สำเร็จ: {exc}")
-                template_name = data.get("template_name")
-            else:
-                # IPM: ไม่ insert parts เลย แค่ query หา template_name
-                template_name = _get_template_name_for_ipm(cur, first_alpl)
+        try:
+            with db.cursor() as cur:
+                # Button Guard — กันรัน 2 session ซ้อนกัน (เหมือนของเดิมก่อนหน้านี้)
+                cur.execute("SELECT session_id FROM sessions WHERE state = 'running'")
+                if cur.fetchone():
+                    raise HTTPException(400, "A session is already running")
 
-            # 2) Insert sessions row (ผ่าน FK ได้แน่นอนแล้ว ไม่ว่าจะ New หรือ IPM)
-            cur.execute(
-                "INSERT INTO sessions (number_alpl, state, target_count, measured_count) "
-                "VALUES (%s, 'running', %s, 0)",
-                (first_alpl, target_count),
-            )
-            session_id = cur.lastrowid
+                if measure_type == "New":
+                    # 1) Insert Part เฉพาะ "ตัวแรก" ในคิวก่อน (ต้องมาก่อน insert
+                    # session เพราะ FK — sessions.number_alpl ต้องมี Part อยู่จริง
+                    # ก่อนถึงจะ insert ได้) ส่วน ALPL ตัวที่เหลือในคิวจะถูก insert
+                    # ทีละตัว "ตอนได้ผลวัดจริง" ใน create_measurement แทน ไม่ insert
+                    # รวดเดียวทั้งคิวแบบเดิม — กันกรณีกด Stop กลางคันแล้วมี Part ที่
+                    # ไม่เคยวัดจริงค้างอยู่ใน DB
+                    #
+                    # ครอบ try/except เพราะ MySQL อาจ throw error ได้หลายแบบตอน
+                    # insert (ALPL ซ้ำ, ข้อมูลผิด type, ค่ายาวเกิน column ฯลฯ) —
+                    # จับ pymysql.MySQLError (base class ของ error ทุกชนิดจาก MySQL)
+                    # ไม่ใช่แค่ IntegrityError ตัวเดียว เพื่อกัน raw exception หลุด
+                    # ออกไปทำให้ response 500 ไม่มี CORS header แนบมา
+                    try:
+                        _insert_part_row(cur, first_alpl, data)
+                    except pymysql.MySQLError as exc:
+                        raise HTTPException(409, f"Insert Part แรกในคิวไม่สำเร็จ: {exc}")
+                    template_name = data.get("template_name")
+                else:
+                    # IPM: ไม่ insert parts เลย แค่ query หา template_name
+                    template_name = _get_template_name_for_ipm(cur, first_alpl)
+
+                # 2) Insert sessions row (ผ่าน FK ได้แน่นอนแล้ว ไม่ว่าจะ New หรือ IPM)
+                cur.execute(
+                    "INSERT INTO sessions (number_alpl, state, target_count, measured_count) "
+                    "VALUES (%s, 'running', %s, 0)",
+                    (first_alpl, target_count),
+                )
+                session_id = cur.lastrowid
+        finally:
+            with db.cursor() as cur:
+                cur.execute("SELECT RELEASE_LOCK('tmx_start_session')")
 
         # 3) เก็บคิวไว้ใน memory ผูกกับ session_id นี้ (หลัง insert สำเร็จแล้ว
         # ค่อยผูก กัน insert fail แล้วมี state ค้างอยู่ใน session_queues)
         # operator/note มาจาก field "Operator"/"Note" ใน payload — ใช้ได้ทั้ง
         # IPM และ New (สำหรับ New เป็น note ของ "การวัดรอบนี้" ไม่ใช่ของตัว
         # part เพราะ parts table ไม่มี column note เลย)
-        session_queues[session_id] = {
+        queue_state = {
             "entry_mode": measure_type,
             "queue": alpl_queue,
             "position": 0,
@@ -458,6 +481,17 @@ async def start_session(request: Request):
             # insert Part ใหม่เลย เพราะ IPM ใช้ Part ที่ลงทะเบียนไว้แล้วทั้งหมด)
             "new_part_config": data if measure_type == "New" else None,
         }
+        session_queues[session_id] = queue_state
+
+        # เขียนสำเนา queue_state ลง DB ด้วย (คอลัมน์ sessions.queue_state) — ถ้า
+        # backend restart กลาง session นี้ จะโหลดกลับเข้า memory ได้ตอน boot
+        # แทนที่จะ fallback ไปใช้ ALPL ตัวแรกผิดๆ ตลอดที่เหลือ (ดู create_measurement
+        # และ lifespan())
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET queue_state = %s WHERE session_id = %s",
+                (json.dumps(queue_state), session_id),
+            )
 
         # 4) Notify Agent ให้เริ่มวัด
         await _notify_agent_start(session_id, template_name, target_count, first_alpl)
@@ -508,44 +542,6 @@ async def stop_session(req: StopSessionRequest):
 
         session_queues.pop(req.session_id, None)  # กดหยุดเองก่อนคิวหมด ก็เคลียร์ memory ทิ้งด้วย
         await push_event("session_stopped", {"session_id": req.session_id})
-        return {"ok": True}
-    finally:
-        db.close()
-
-
-@app.post("/api/heartbeat")
-async def heartbeat(req: HeartbeatRequest):
-    """รับ heartbeat ping จาก Agent
-
-    ทำไม: นี่คืออีกครึ่งของ heartbeat_checker — Agent จะเรียก endpoint นี้ทุก
-    HB_INTERVAL วินาทีตอนที่มันยังทำงานอยู่ เราอัปเดต last_seen เพื่อให้ตัวเช็ค
-    พื้นหลังรู้ว่าสถานียังตอบสนองอยู่ ถ้า session ก่อนหน้านี้ถูก mark เป็น 'timeout'
-    ไปแล้ว แต่มี heartbeat เข้ามาสำหรับ session นั้น เราจะถือว่าสถานีกลับมาออนไลน์แล้ว
-    และเปลี่ยนกลับเป็น 'idle' (ไม่ปล่อยให้มันค้างเป็น timeout ตลอดไป) แล้วแจ้ง
-    dashboard ผ่าน SSE
-    """
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            if req.session_id is not None:
-                cur.execute(
-                    "SELECT state FROM sessions WHERE session_id = %s", (req.session_id,)
-                )
-                row = cur.fetchone()
-                if row and row["state"] == "timeout":
-                    cur.execute(
-                        "UPDATE sessions SET state = 'idle', last_seen = NOW() "
-                        "WHERE session_id = %s",
-                        (req.session_id,),
-                    )
-                    await push_event("station_online", {"session_id": req.session_id})
-                else:
-                    cur.execute(
-                        "UPDATE sessions SET last_seen = NOW() WHERE session_id = %s",
-                        (req.session_id,),
-                    )
-            else:
-                await push_event("station_online", {"session_id": None, "status": "connected"})
         return {"ok": True}
     finally:
         db.close()
@@ -993,6 +989,10 @@ class MeasurementCreate(BaseModel):
     value_x:     float
     value_y:     float
     note:        Optional[str] = None
+    # UUID ที่ Agent สร้างขึ้นต่อการวัด 1 ครั้ง (uuid4) — ส่งมาด้วยทุกครั้งที่มา
+    # จาก agent.py (ไม่มีถ้าเป็น manual add จาก edit.html) ใช้กัน insert ซ้ำ
+    # ตอน Agent retry POST นี้ (ดู create_measurement)
+    client_uuid: Optional[str] = None
 
 
 class ImageUpdate(BaseModel):
@@ -1072,6 +1072,37 @@ async def create_measurement(req: MeasurementCreate):
     qstate = None
     db = get_db()
     try:
+        # กันการ insert ซ้ำถ้า Agent retry POST นี้ด้วย client_uuid เดิม (เช่น
+        # ตอบกลับจาก request ครั้งก่อนหลุดหายระหว่างทาง ทั้งที่จริง backend
+        # insert สำเร็จไปแล้ว) — เช็คก่อนทำอะไรอื่นเลย ถ้าเคยเห็น UUID นี้แล้ว
+        # คืนผลเดิมไปตรงๆ ไม่ insert แถวใหม่ ไม่นับ measured_count ซ้ำ
+        if req.client_uuid:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT measurement_id, session_id, result FROM measurements "
+                    "WHERE client_uuid = %s",
+                    (req.client_uuid,),
+                )
+                dup = cur.fetchone()
+            if dup:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT measured_count, target_count FROM sessions WHERE session_id = %s",
+                        (dup["session_id"],),
+                    )
+                    s = cur.fetchone() or {}
+                log.info(
+                    "Duplicate measurement POST (client_uuid=%s) — คืนผลเดิม measurement_id=%d",
+                    req.client_uuid, dup["measurement_id"],
+                )
+                return {
+                    "measurement_id": dup["measurement_id"],
+                    "result":  dup["result"],
+                    "status":  "duplicate_ignored",
+                    "measured": s.get("measured_count"),
+                    "target":   s.get("target_count"),
+                }
+
         with db.cursor() as cur:
             if is_manual:
                 # ── Manual add จากหน้า Database Editor (edit.html) ──────────
@@ -1161,12 +1192,20 @@ async def create_measurement(req: MeasurementCreate):
             # Insert row ของ measurement (รวม measure_type/operator_id/note ถ้าเป็น
             # queue-based หรือ manual add — สำหรับ manual session (ผ่าน Agent) แบบเดิม
             # ทั้ง 3 ค่านี้จะเป็น NULL)
-            cur.execute(
-                "INSERT INTO measurements "
-                "(session_id, number_alpl, value_x, value_y, result, measure_type, operator_id, note) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (session_id, number_alpl, req.value_x, req.value_y, result, measure_type, operator_id, note),
-            )
+            try:
+                cur.execute(
+                    "INSERT INTO measurements "
+                    "(session_id, number_alpl, value_x, value_y, result, measure_type, operator_id, note, client_uuid) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (session_id, number_alpl, req.value_x, req.value_y, result, measure_type, operator_id, note, req.client_uuid),
+                )
+            except pymysql.IntegrityError:
+                # race เล็กๆ ที่ทฤษฎีมีได้: สอง request ที่มี client_uuid เดียวกัน
+                # มาถึงพร้อมกันเป๊ะๆ ผ่านเช็ค dedup ด้านบนพร้อมกันทั้งคู่ (เช็คแล้ว
+                # ยังไม่เจอ เพราะอีกฝั่งยัง insert ไม่เสร็จ) — unique index บน
+                # client_uuid จะกันไม่ให้ insert ซ้ำจริงๆ ระดับ DB อยู่ดี แค่ต้อง
+                # จับ error แล้วบอกให้รู้ว่าเป็นการซ้ำ ไม่ใช่ปล่อยเป็น 500 ดิบๆ
+                raise HTTPException(409, "Measurement นี้ถูกบันทึกไปแล้ว (duplicate client_uuid)")
             measurement_id = cur.lastrowid
 
             if not is_manual:
@@ -1191,10 +1230,17 @@ async def create_measurement(req: MeasurementCreate):
                 measured, target = 1, 1
 
         if not is_manual:
-            # เพิ่มตำแหน่งในคิว (memory เท่านั้น) — ทำหลังปิด cursor ของ DB เพื่อ
-            # ไม่ปนกับ transaction ของ DB เลย (นี่ไม่ใช่ DB operation)
+            # เพิ่มตำแหน่งในคิว (memory) แล้ว sync สำเนาลง DB ทันที (คอลัมน์
+            # sessions.queue_state) — กัน backend restart กลาง session นี้แล้ว
+            # ตำแหน่งคิวหาย ทำให้ measurement หลังจากนั้นถูกบันทึกผิด ALPL ไปเรื่อยๆ
+            # แบบเงียบๆ (ดู lifespan() ที่โหลดค่านี้กลับตอน boot)
             if qstate is not None:
                 qstate["position"] += 1
+                with db.cursor() as cur:
+                    cur.execute(
+                        "UPDATE sessions SET queue_state = %s WHERE session_id = %s",
+                        (json.dumps(qstate), session_id),
+                    )
 
         # Auto-complete session เมื่อถึง target_count แล้ว — เฉพาะ session จริง
         # ของ Agent เท่านั้น (manual session จบในตัวเองไปแล้วตั้งแต่ insert)
@@ -1465,3 +1511,33 @@ async def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=measurements.csv"},
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Static dashboard files (index.html / edit.html)
+# ══════════════════════════════════════════════════════════════════════════════
+# ต้องอยู่ล่างสุดของไฟล์เสมอ — mount ที่ "/" ทำหน้าที่เป็น catch-all ให้ทุก
+# path ที่ไม่ตรงกับ route ไหนเลยด้านบน ถ้า register ไว้ก่อน (เช่นบนสุดของไฟล์)
+# มันจะดักจับ request ของ /api/... ไปหมดก่อนถึง route จริง ทำให้ API พังทันที
+#
+# โครงสร้างจริงของโปรเจกต์เป็นแบบนี้ (คนละโฟลเดอร์กับ main.py):
+#   TM-X_Project/
+#     Backend-server/main.py   (ไฟล์นี้)
+#     Backend-pc_station/agent_real.py
+#     Frontend/index.html, edit.html, ...
+# ดังนั้นต้องถอยขึ้นไป 1 ชั้นจาก main.py แล้วเข้าโฟลเดอร์ Frontend แทนที่จะใช้
+# โฟลเดอร์เดียวกับไฟล์นี้ตรงๆ (ที่พังก่อนหน้านี้เพราะ index.html ไม่ได้อยู่ใน
+# Backend-server/ ด้วย)
+#
+# html=True ทำให้เข้า "/" แล้วได้ index.html อัตโนมัติ และเข้า "/edit.html"
+# ได้ตรงๆ — เหตุผลที่ทำแบบนี้แทนรัน web server แยก: จะได้มีแค่ process เดียว
+# (uvicorn) ให้ autostart/ผูก host=127.0.0.1 ตัวเดียวจบ ไม่ต้องเปิดอีก process
+# มาเสิร์ฟไฟล์ static ต่างหาก
+_frontend_dir = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Frontend")
+)
+app.mount(
+    "/",
+    StaticFiles(directory=_frontend_dir, html=True),
+    name="static",
+)

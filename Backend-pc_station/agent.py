@@ -447,7 +447,7 @@ async def main() -> None:
     _init_serial()
 
     server = uvicorn.Server(
-        uvicorn.Config(http_app, host="0.0.0.0", port=AGENT_PORT, log_level="info")
+        uvicorn.Config(http_app, host="127.0.0.1", port=AGENT_PORT, log_level="info")
     )
 
     await asyncio.gather(
