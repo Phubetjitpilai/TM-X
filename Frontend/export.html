@@ -68,6 +68,16 @@
       transition: color .15s;
     }
     .topbar-link:hover { color: var(--accent); }
+    .station-badge {
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.3rem 0.85rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+    .station-badge.online     { background: var(--ok-bg);   border-color: var(--ok);   color: var(--ok); }
+    .station-badge.offline    { background: var(--ng-bg);   border-color: var(--ng);   color: var(--ng); }
+    .station-badge.connecting { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
 
     .main {
       padding: 3rem 2rem;
@@ -88,11 +98,35 @@
       <a class="topbar-link" href="export.html">Export</a>
     </nav>
   </div>
+  <span class="station-badge connecting" id="station-badge">🟡 Connecting</span>
 </header>
 
 <main class="main">
   <p class="placeholder">Export — Coming soon</p>
 </main>
+
+<script>
+  // ── สถานะการเชื่อมต่อ Backend (เหมือน index.html / edit.html) ──────────
+  const API = 'http://localhost:8000';
+  let sse = null;
+
+  function setStationBadge(status) {
+    const el = document.getElementById('station-badge');
+    const map = { online: '🟢 Online', offline: '🔴 Offline', connecting: '🟡 Connecting' };
+    el.textContent = map[status] || status;
+    el.className = `station-badge ${status}`;
+  }
+
+  function connectSSE() {
+    if (sse) { sse.close(); sse = null; }
+    setStationBadge('connecting');
+    sse = new EventSource(`${API}/api/stream`);
+    sse.onopen  = () => setStationBadge('online');
+    sse.onerror = () => { setStationBadge('offline'); setTimeout(connectSSE, 3000); };
+  }
+
+  document.addEventListener('DOMContentLoaded', connectSSE);
+</script>
 
 </body>
 </html>

@@ -101,6 +101,16 @@
       transition: color .15s;
     }
     .topbar-link:hover { color: var(--accent); }
+    .station-badge {
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.3rem 0.85rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+    .station-badge.online     { background: var(--ok-bg);   border-color: var(--ok);   color: var(--ok); }
+    .station-badge.offline    { background: var(--ng-bg);   border-color: var(--ng);   color: var(--ng); }
+    .station-badge.connecting { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
 
     /* ── Main content ──────────────────────────────────────────────────── */
     .main {
@@ -377,6 +387,7 @@
       <a class="topbar-link" href="export.html">Export</a>
     </nav>
   </div>
+  <span class="station-badge connecting" id="station-badge">🟡 Connecting</span>
 </header>
 
 <main class="main">
@@ -513,6 +524,30 @@
   // การตั้งค่าตัวแปรสำหรับเชื่อมต่อ API 
   // ══════════════════════════════════════════════════════════════════════
   const API = 'http://localhost:8000'; // ปรับ URL ให้ตรงกับเซิร์ฟเวอร์ของคุณ
+
+  // ── สถานะการเชื่อมต่อ Backend (เหมือน index.html) ──────────────────────
+  // หน้านี้ไม่ได้ใช้ SSE ขับ table เหมือน index.html (ยังคง poll
+  // checkSessionRunning ทุก 4 วิเหมือนเดิม) แต่เปิด EventSource ไว้ "เฉยๆ"
+  // เพื่อรู้ว่า backend ยังตอบสนองอยู่ไหม แล้วขึ้น badge ให้เหมือนหน้า Home
+  let sse = null;
+  let stationStatus = 'connecting';
+
+  function setStationBadge(status) {
+    stationStatus = status;
+    const el = document.getElementById('station-badge');
+    const map = { online: '🟢 Online', offline: '🔴 Offline', connecting: '🟡 Connecting' };
+    el.textContent = map[status] || status;
+    el.className = `station-badge ${status}`;
+  }
+
+  function connectSSE() {
+    if (sse) { sse.close(); sse = null; }
+    setStationBadge('connecting');
+    sse = new EventSource(`${API}/api/stream`);
+    sse.onopen  = () => setStationBadge('online');
+    sse.onerror = () => { setStationBadge('offline'); setTimeout(connectSSE, 3000); };
+  }
+
   let partsData = [];          // เก็บเฉพาะ "หน้าปัจจุบัน" ของ parts (ไม่ใช่ทั้งหมด)
   let measurementsData = [];   // เก็บเฉพาะ "หน้าปัจจุบัน" ของ measurements
 
@@ -543,6 +578,7 @@
   let handlerOptions = [], vendorOptions = [], categoryOptions = [], ownerOptions = [];
 
   document.addEventListener('DOMContentLoaded', async () => {
+    connectSSE();
     // โหลด "หน้าแรก" ของทั้ง 2 ตารางแบบ server-side (คนละ request กัน) แล้วค่อย render
     await Promise.all([loadParts(), loadMeasurements(), loadDropdownData(), checkSessionRunning()]);
     renderPartsTable();

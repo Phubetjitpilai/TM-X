@@ -58,6 +58,14 @@ MINIO_BUCKET    = "tmx-images"
 AGENT_PORT      = int(os.getenv("AGENT_PORT", 9998))
 AGENT_BASE_URL  = f"http://localhost:{AGENT_PORT}"
 
+# heartbeat: Agent ยิง POST /api/heartbeat มาทุก HEARTBEAT_INTERVAL วิ ระหว่างที่
+# ยังรันอยู่ (ดู agent.py heartbeat_loop) — heartbeat_checker() ด้านล่างเช็คเป็น
+# ระยะว่า session ที่ 'running' ยังได้ heartbeat ต่อเนื่องไหม ถ้าเงียบเกิน
+# HEARTBEAT_TIMEOUT วิ (Agent process ตาย/แฮงค์กลาง session) จะ mark เป็น
+# 'timeout' อัตโนมัติ (เอากลับมาใหม่ตามที่ตกลงกันไว้)
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 5))
+HEARTBEAT_TIMEOUT  = int(os.getenv("HEARTBEAT_TIMEOUT", 15))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [Server] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -98,8 +106,19 @@ def get_db():
     ทำไมต้องเปิดใหม่ทุกครั้งแทนใช้ connection pool: นี่คือระบบที่ deploy บน PC เดียว
     มี concurrency ต่ำ ความเรียบง่ายของ "connect → ใช้งาน → close" จึงคุ้มกว่าความซับซ้อน
     ของการทำ pool ทุก endpoint ด้านล่างจะเปิด connection นี้ใน try/finally แล้วปิดเมื่อใช้เสร็จ
+
+    หมายเหตุ (เพิ่มเข้ามาทีหลัง): endpoint ทุกตัวเรียก get_db() "ก่อน" เข้า try/finally
+    ของตัวเอง ถ้า MySQL server ล่ม/ต่อไม่ติดเลย pymysql.connect() จะ raise
+    OperationalError ซึ่งเป็น raw exception ที่ FastAPI ไม่รู้จัก — หลุดออกไปกลายเป็น
+    500 ดิบไม่มี CORS header แนบมา (ปัญหาเดียวกับที่ _notify_agent_start เจอกับ Agent)
+    จับไว้ตรงนี้ที่เดียวแล้ว raise เป็น HTTPException(503) แทน เพื่อให้ CORS header
+    ยังติดมาด้วยเสมอ ไม่ต้องไปแก้ทุก endpoint
     """
-    return pymysql.connect(**DB_CONFIG)
+    try:
+        return pymysql.connect(**DB_CONFIG)
+    except pymysql.MySQLError as exc:
+        log.error("Database connection failed: %s", exc)
+        raise HTTPException(503, f"เชื่อมต่อฐานข้อมูลไม่สำเร็จ: {exc}")
 
 
 def get_minio() -> Minio:
@@ -188,23 +207,62 @@ async def _reload_session_queues() -> None:
         log.warning("Reload session_queues failed: %s", exc)
 
 
+async def heartbeat_checker() -> None:
+    """ตรวจเป็นระยะว่า session ที่ 'running' ยังได้ heartbeat จาก Agent ต่อเนื่องไหม
+
+    หมายเหตุ: ก่อนหน้านี้เคยถอดกลไกนี้ออกไปเพราะตอนนั้น Agent/Backend/Web รันอยู่
+    บนเครื่องเดียวกันหมด คิดว่าไม่จำเป็น — ตอนนี้เอากลับมาใหม่ตามที่ตกลงกันไว้
+    เป็น safety net เผื่อ Agent process ตาย/แฮงค์กลาง session (ไม่ใช่แค่ network
+    หลุดข้ามเครื่องเหมือนเหตุผลเดิม) ถ้าเงียบเกิน HEARTBEAT_TIMEOUT วิ จะ mark
+    session เป็น 'timeout' อัตโนมัติ แล้วแจ้ง web ผ่าน SSE (`session_timeout` —
+    index.html มี handler นี้อยู่แล้ว แค่ก่อนหน้านี้ไม่มีใคร emit ให้)
+    """
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            db = get_db()
+        except HTTPException as exc:
+            log.warning("heartbeat_checker: DB unreachable, skip this round: %s", exc.detail)
+            continue
+
+        timed_out: List[int] = []
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM sessions "
+                    "WHERE state = 'running' AND last_seen < NOW() - INTERVAL %s SECOND",
+                    (HEARTBEAT_TIMEOUT,),
+                )
+                timed_out = [row["session_id"] for row in cur.fetchall()]
+                for sid in timed_out:
+                    cur.execute(
+                        "UPDATE sessions SET state = 'timeout', ended_at = NOW() "
+                        "WHERE session_id = %s",
+                        (sid,),
+                    )
+        except Exception as exc:
+            log.warning("heartbeat_checker: check failed: %s", exc)
+            timed_out = []
+        finally:
+            db.close()
+
+        for sid in timed_out:
+            session_queues.pop(sid, None)
+            log.warning("Session %s: ไม่ได้ heartbeat เกิน %ss — mark เป็น 'timeout'", sid, HEARTBEAT_TIMEOUT)
+            await push_event("session_timeout", {"session_id": sid})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Hook ตอน FastAPI เริ่มทำงาน (startup) และตอนปิด (shutdown)
 
-    ทำไม: ตรงนี้คือจุดที่ background task (สร้าง MinIO bucket) ถูกสั่งให้เริ่ม
-    ทำงานตอนแอป boot แทนที่จะไปสั่งเริ่มภายใน request handler ส่วน
+    ทำไม: ตรงนี้คือจุดที่ background task (สร้าง MinIO bucket, heartbeat_checker)
+    ถูกสั่งให้เริ่มทำงานตอนแอป boot แทนที่จะไปสั่งเริ่มภายใน request handler ส่วน
     _reload_session_queues() ต้อง await ให้เสร็จก่อน yield เพราะต้องกู้คืนคิว
     ให้ครบก่อนรับ request
-
-    หมายเหตุ: เดิมมี heartbeat_checker() คู่กันด้วย (ตรวจ Agent เงียบหายกลาง
-    session แล้ว mark เป็น 'timeout') — เอาออกแล้วเพราะ Agent/Backend/Web รันอยู่
-    บน Pi เครื่องเดียวกันหมด (localhost) ค่าที่มันเคยป้องกัน (network/สถานีหลุด
-    ระหว่างเครื่อง) ไม่ค่อยมีความหมายแล้ว ยอมรับความเสี่ยงที่เหลืออยู่ (ถ้า Agent
-    process ตาย/แฮงค์กลาง session ตัว session จะค้างเป็น 'running' ตลอดไปจนกว่า
-    จะกด Stop เองจาก dashboard) ตามที่ตกลงกันไว้
     """
     asyncio.create_task(_init_bucket_bg())       # fire-and-forget, never blocks
+    asyncio.create_task(heartbeat_checker())     # fire-and-forget, never blocks
     await _reload_session_queues()               # ต้องเสร็จก่อนรับ request
     yield
 
@@ -545,6 +603,35 @@ async def stop_session(req: StopSessionRequest):
         return {"ok": True}
     finally:
         db.close()
+
+
+class HeartbeatRequest(BaseModel):
+    session_id: Optional[int] = None
+
+
+@app.post("/api/heartbeat")
+async def heartbeat(req: HeartbeatRequest):
+    """รับ heartbeat จาก Agent (ดู agent.py heartbeat_loop — ยิงมาทุก
+    HEARTBEAT_INTERVAL วิ ไม่ว่าจะมี session running อยู่หรือไม่)
+
+    ถ้าไม่มี session_id (Agent ยัง idle ไม่มีงานอยู่) แค่ตอบ ok เฉยๆ ไม่ต้องแตะ DB
+    ถ้ามี session_id จะอัปเดต sessions.last_seen = NOW() ให้ heartbeat_checker()
+    เอาไปเทียบว่า session นี้ยังมี Agent ส่งสัญญาณชีพอยู่ไหม — เงื่อนไข
+    `state = 'running'` กันไม่ให้ heartbeat ที่มาช้า/ค้างจาก session เก่าที่จบไป
+    แล้วไปอัปเดต last_seen ของ session ผิดตัว
+    """
+    if req.session_id is None:
+        return {"ok": True}
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET last_seen = NOW() WHERE session_id = %s AND state = 'running'",
+                (req.session_id,),
+            )
+    finally:
+        db.close()
+    return {"ok": True}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -996,7 +1083,12 @@ class MeasurementCreate(BaseModel):
 
 
 class ImageUpdate(BaseModel):
-    image_path: str
+    # image_path เป็น Optional แล้ว — กรณี Agent อัปโหลดรูปขึ้น MinIO ไม่สำเร็จ
+    # ครบ 3 ครั้ง (ดู agent.py upload_image) จะ PATCH มาด้วย image_path=None,
+    # upload_failed=True แทน เพื่อให้ backend รู้ว่า "พยายามแล้วแต่ไม่สำเร็จ"
+    # ต่างจาก "ยังไม่เคยพยายามเลย" (NULL เฉยๆ ตอน insert)
+    image_path:    Optional[str] = None
+    upload_failed: bool = False
 
 
 @app.get("/api/measurements")
@@ -1378,14 +1470,19 @@ async def update_image(measurement_id: int, req: ImageUpdate):
     try:
         with db.cursor() as cur:
             cur.execute(
-                "UPDATE measurements SET image_path = %s WHERE measurement_id = %s",
-                (req.image_path, measurement_id),
+                "UPDATE measurements SET image_path = %s, image_upload_failed = %s "
+                "WHERE measurement_id = %s",
+                (req.image_path, req.upload_failed, measurement_id),
             )
             if cur.rowcount == 0:
                 raise HTTPException(404, "Measurement not found")
         await push_event(
             "image_updated",
-            {"measurement_id": measurement_id, "image_path": req.image_path},
+            {
+                "measurement_id": measurement_id,
+                "image_path": req.image_path,
+                "upload_failed": req.upload_failed,
+            },
         )
         return {"ok": True}
     finally:

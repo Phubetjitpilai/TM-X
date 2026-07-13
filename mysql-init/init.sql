@@ -82,18 +82,24 @@ CREATE TABLE parts (
 -- เพราะ main.py ทั้งไฟล์ query/insert สองตารางนี้ด้วยคอลัมน์ number_alpl ตรงๆ
 -- ทุกจุด (เช่น "INSERT INTO sessions (number_alpl, ...)") — number_alpl ใน
 -- parts มี UNIQUE constraint จึงใช้เป็นเป้าหมายของ FOREIGN KEY ได้เหมือน PK
+-- queue_state: สำเนา JSON ของคิว ALPL (session_queues ใน memory ของ backend)
+-- เขียนทับทุกครั้งที่มีการเปลี่ยนแปลง ใช้กู้คืนคิวกลับเข้า memory ถ้า backend
+-- restart กลาง session ที่ยัง running อยู่ (ดู migrate_add_reliability.sql)
 CREATE TABLE sessions (
   session_id     INT          AUTO_INCREMENT PRIMARY KEY,
   number_alpl    INT          NOT NULL,
   state          VARCHAR(20)  NOT NULL DEFAULT 'idle',
   target_count   INT          NOT NULL DEFAULT 1,
   measured_count INT          NOT NULL DEFAULT 0,
+  queue_state    JSON         NULL,
   last_seen      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   started_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   ended_at       DATETIME     NULL,
   FOREIGN KEY (number_alpl) REFERENCES parts(number_alpl) ON UPDATE CASCADE
 );
 
+-- client_uuid: UUID ที่ Agent สร้างต่อการวัด 1 ครั้ง ใช้กัน insert ซ้ำตอน retry
+-- POST /api/measurements (ดู migrate_add_reliability.sql สำหรับรายละเอียด)
 CREATE TABLE measurements (
   measurement_id INT          AUTO_INCREMENT PRIMARY KEY,
   session_id     INT          NOT NULL,
@@ -102,9 +108,11 @@ CREATE TABLE measurements (
   value_y        FLOAT        NOT NULL,
   result         VARCHAR(10)  NOT NULL,
   note           TEXT,
+  client_uuid    VARCHAR(36)  NULL UNIQUE,
   measure_type   VARCHAR(10)  NOT NULL,
   operator_id    INT          NOT NULL,
   image_path     VARCHAR(255),
+  image_upload_failed TINYINT(1) NOT NULL DEFAULT 0,
   timestamp      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (session_id)  REFERENCES sessions(session_id),
   FOREIGN KEY (number_alpl) REFERENCES parts(number_alpl) ON UPDATE CASCADE,

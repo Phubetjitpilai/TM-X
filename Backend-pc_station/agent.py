@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from typing import Optional
 
 import httpx
@@ -151,9 +152,6 @@ class MeasurementData(BaseModel):
 
 
 # ── Image upload to MinIO with retry ─────────────────────────────────────────
-# ไม่แก้ฟังก์ชันนี้เลย — ใช้ flow เดิมทุกอย่างตามที่ตกลงกันไว้ ("ส่วนรูปก็ส่ง
-# แบบเดิม") ทั้ง mock flow และ flow จริง (ถ้าย้อนกลับไปใช้ในอนาคต) เรียกใช้
-# ฟังก์ชันนี้ตัวเดียวกัน
 async def upload_image(image_path: str, measurement_id: int) -> None:
     filename = os.path.basename(image_path)
     for attempt in range(1, 4):
@@ -191,6 +189,25 @@ async def upload_image(image_path: str, measurement_id: int) -> None:
 
     log.error("Image upload failed after 3 attempts: %s", image_path)
 
+    # แจ้ง backend ว่ารูปของ measurement นี้อัปโหลดไม่สำเร็จ (ล้มเหลวครบ 3 ครั้ง)
+    # เดิมพอ retry ครบแล้วแค่ log.error ในเครื่อง Agent เฉยๆ — measurement จะมี
+    # image_path เป็น NULL ตลอดไปโดยไม่มีใครใน backend/web รู้เรื่องเลยว่าเกิด
+    # อะไรขึ้น (แยกไม่ออกจากกรณี "ยังไม่มีรูปเพราะเป็น manual add") ตอนนี้ยิง
+    # PATCH บอก backend ตรงๆ ว่า upload_failed=True เพื่อให้ web ขึ้น badge เตือน
+    # ในตาราง (ดู main.py update_image + index.html imgCell)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{BACKEND_URL}/api/measurements/{measurement_id}/image",
+                json={"image_path": None, "upload_failed": True},
+                timeout=10,
+            )
+    except Exception as exc:
+        log.error(
+            "แจ้ง backend ว่า image upload failed ก็ยังไม่สำเร็จอีก (measurement #%d): %s",
+            measurement_id, exc,
+        )
+
 
 # ── Cleanup Store_image_temporary ────────────────────────────────────────────
 def _cleanup_temp_images() -> None:
@@ -222,9 +239,14 @@ def _generate_mock_measurement() -> "MeasurementData":
                             value_y=round(random.uniform(1.0, 20.0), 3))
 
 
-async def mock_single_measurement(index: int) -> None:
-    """ทำ 1 รอบของการ "วัด" แบบ mock: gen ค่า → POST ไป backend → หา/อัปโหลด
-    รูป (เหมือน flow จริงทุกอย่าง ไม่แก้ส่วนนี้) — ไม่แตะ TCP/Serial เลย
+async def mock_single_measurement(index: int) -> bool:
+    """ทำ 1 รอบของการ "วัด" แบบ mock: gen ค่า → POST ไป backend (retry ได้ถึง
+    3 ครั้งถ้าเจอปัญหาเชื่อมต่อ/backend ล่มชั่วคราว) → หา/อัปโหลดรูป (เหมือน
+    flow เดิมทุกอย่าง ไม่แก้ส่วนนี้) — ไม่แตะ TCP/Serial เลย
+
+    คืนค่า True ถ้าบันทึกลง backend สำเร็จ, False ถ้าล้มเหลวจนต้องข้ามชิ้นนี้ไป
+    (mock_measurement_flow เอาไปนับว่าวัด "สำเร็จจริง" กี่ชิ้นจาก target_count —
+    ไม่ใช่แค่ "ลองแล้ว" กี่ชิ้น เพื่อไม่ให้ข้อความสรุปท้าย flow โกหกว่าครบ)
     """
     global current_session_id, current_number_alpl
 
@@ -236,24 +258,57 @@ async def mock_single_measurement(index: int) -> None:
     # get_new_image() ตรงๆ ได้เลย ไม่ต้อง gather กับ tcp_task แบบเดิม)
     image_path = await get_new_image()
 
-    try:
-        print(1) 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{BACKEND_URL}/api/measurements",
-                json={
-                    "session_id":  current_session_id,
-                    "number_alpl": current_number_alpl,  # backend จะ override ด้วยค่าจากคิวเองอยู่แล้ว
-                    "value_x":     m.value_x,
-                    "value_y":     m.value_y,
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        log.error("POST /api/measurements failed: %s", exc)
-        return
+    # client_uuid: สร้างครั้งเดียวต่อการวัดนี้ แล้วใช้ตัวเดิมซ้ำทุกครั้งที่ retry
+    # ด้านล่าง — เป็น idempotency key ให้ backend เช็คได้ว่าเป็น request เดิม
+    # ที่ retry มา ไม่ใช่การวัดครั้งใหม่ (กัน insert ซ้ำ/นับ measured_count ซ้ำ
+    # ถ้ารอบก่อน backend บันทึกสำเร็จไปแล้วจริงๆ แต่ response หลุดหายกลับมาไม่ถึง
+    # Agent — ดู main.py create_measurement ที่ dedup ด้วย client_uuid นี้อยู่แล้ว)
+    client_uuid = str(uuid.uuid4())
+    data = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{BACKEND_URL}/api/measurements",
+                    json={
+                        "session_id":  current_session_id,
+                        "number_alpl": current_number_alpl,  # backend จะ override ด้วยค่าจากคิวเองอยู่แล้ว
+                        "value_x":     m.value_x,
+                        "value_y":     m.value_y,
+                        "client_uuid": client_uuid,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status < 500:
+                # 4xx = backend ปฏิเสธ request นี้ตรงๆ (เช่น session ไม่ได้
+                # running แล้ว/timeout ไปแล้วจาก heartbeat_checker) — retry ซ้ำ
+                # ไปก็ไม่มีทางสำเร็จ ยกเลิกทันที ไม่ต้องเสียเวลาลองอีก
+                log.error("Mock measurement #%d: backend ปฏิเสธ (HTTP %d): %s", index, status, exc)
+                break
+            log.warning("Mock measurement #%d: POST attempt %d/3 failed (HTTP %d): %s",
+                        index, attempt, status, exc)
+        except Exception as exc:
+            log.warning("Mock measurement #%d: POST attempt %d/3 failed: %s", index, attempt, exc)
+        if attempt < 3:
+            await asyncio.sleep(2)
+
+    if data is None:
+        # แจ้งเตือนให้เห็นชัดๆ ที่ terminal ทันที (เหมือน print "✅ ได้รับคำสั่ง
+        # Start"/"✅ Done" ที่มีอยู่แล้ว) ไม่ใช่แค่ log เฉยๆ เพราะ operator ที่
+        # เฝ้าหน้าจออยู่ควรรู้ทันทีว่าชิ้นนี้ข้อมูลหาย ต้องไปจัดการเอง
+        print(f"❌ ชิ้นที่ {index}/{current_target_count}: บันทึกไม่สำเร็จ "
+              f"(x={m.value_x:.3f}, y={m.value_y:.3f}) — ข้ามไปชิ้นถัดไป")
+        log.error(
+            "Mock measurement #%d: POST /api/measurements ล้มเหลวหลังลองครบ 3 ครั้ง "
+            "(หรือถูกปฏิเสธ) — ค่า x=%.3f, y=%.3f ของชิ้นนี้ไม่ถูกบันทึก",
+            index, m.value_x, m.value_y,
+        )
+        return False
 
     measurement_id = data["measurement_id"]
     log.info(
@@ -266,6 +321,8 @@ async def mock_single_measurement(index: int) -> None:
         task = asyncio.create_task(upload_image(image_path, measurement_id))
         _pending_uploads.append(task)
         task.add_done_callback(_pending_uploads.remove)
+
+    return True
 
 
 async def mock_measurement_flow() -> None:
@@ -283,11 +340,18 @@ async def mock_measurement_flow() -> None:
     log.info("Mock start: session=%s template=%r target_count=%s",
               current_session_id, current_template_name, current_target_count)
 
-    for i in range(1, (current_target_count or 0) + 1):
+    # นับ "สำเร็จจริง" แยกจาก "ลองแล้วกี่รอบ" — ถ้าบางชิ้น POST ล้มเหลวถาวร
+    # (ดู mock_single_measurement) จะข้ามไปชิ้นถัดไปแทนที่จะหยุดทั้ง session
+    # แต่ต้องรู้ตัวเลขจริงตอนสรุปท้าย flow ไม่ใช่โกหกว่า "วัดครบ N ชิ้นแล้ว"
+    # ทั้งที่จริงมีบางชิ้นข้อมูลหายไป
+    succeeded = 0
+    target = current_target_count or 0
+    for i in range(1, target + 1):
         if not is_running:
             log.warning("Mock flow: ถูกสั่ง stop กลางทาง (รอบที่ %d/%d) — หยุดเลย", i, current_target_count)
             return
-        await mock_single_measurement(i)
+        if await mock_single_measurement(i):
+            succeeded += 1
 
     async with _state_lock:
         is_running = False
@@ -298,8 +362,13 @@ async def mock_measurement_flow() -> None:
         await asyncio.gather(*_pending_uploads, return_exceptions=True)
     _cleanup_temp_images()
 
-    print(f"✅ Done — วัดครบ {current_target_count} ชิ้นแล้ว (session_id={current_session_id})")
-    log.info("Mock flow done: session=%s", current_session_id)
+    if succeeded == target:
+        print(f"✅ Done — วัดครบ {target} ชิ้นแล้ว (session_id={current_session_id})")
+    else:
+        print(f"⚠️ Done — วัดสำเร็จ {succeeded}/{target} ชิ้น "
+              f"({target - succeeded} ชิ้นบันทึกไม่สำเร็จ ดู log ด้านบน) "
+              f"(session_id={current_session_id})")
+    log.info("Mock flow done: session=%s สำเร็จ %d/%d", current_session_id, succeeded, target)
 
 
 # ── Object-ready consumer loop ────────────────────────────────────────────────

@@ -618,6 +618,7 @@
     }
     .img-btn-inner:hover { background: var(--surface2); border-color: var(--muted); }
     .no-img { color: var(--border); }
+    .no-img.upload-failed { color: var(--ng); font-weight: 600; cursor: help; }
 
     @keyframes row-highlight {
       0%   { background: rgba(55,138,222,.18); }
@@ -1185,6 +1186,14 @@
       .then(() => connectSSE());
     initPartEntry();
     bindMeasurementFilters();
+
+    // Polling สำรองคู่กับ SSE (เหมือน checkSessionRunning ของ edit.html) — เผื่อ
+    // เคส connection ค้างแบบเงียบๆ (ไม่ error เลยไม่ trigger onerror/reconnect
+    // แต่ก็ไม่มี event ใหม่วิ่งเข้ามาด้วย) ซึ่งเกิดยากกว่าแต่เป็นไปได้ ไม่ต้องรอ
+    // event/reconnect ฝั่งเดียวอีกต่อไป — เรียก loadSessionState() ตรงๆ ทุก 5 วิ
+    // ซึ่งวิ่งผ่าน updateSession() ที่มีเช็ค session_id ของคิว (queueIsStale)
+    // อยู่แล้ว ไม่ต้องเขียน logic เคลียร์คิวซ้ำอีกชุด
+    setInterval(loadSessionState, 5000);
   });
 
   // ── Measurements filter/pagination bindings — เหมือน edit.html ─────────────
@@ -1293,6 +1302,31 @@
   function updateSession(data) {
     session = { ...session, ...data };
     renderSessionUI();
+
+    // เคลียร์คิว Part Entry ถ้าคิวที่ค้างอยู่ผูกกับ session ที่จบไปแล้ว — เช็คจาก
+    // session_id ที่ผูกไว้กับคิวตอนกด Start สำเร็จ (ดู startFromQueue) เทียบกับ
+    // session ปัจจุบันจาก backend ตรงๆ ทุกครั้งที่ sync ไม่ใช่แค่ตอนเห็น
+    // transition สดในแท็บนี้เท่านั้น (แบบเดิมที่เคยลองมาก่อน) เพราะกรณีจริงที่
+    // เจอคือ: เปิดหน้า/refresh "หลัง" session จบไปแล้ว (เช่นปิดแท็บตอนกำลังวัด
+    // แล้วเปิดใหม่ทีหลัง) session.state ในแท็บนี้ไม่เคยเป็น 'running' มาก่อนเลย
+    // เช็คแบบ transition-only เลยจับไม่ได้ ต้องเทียบ session_id ตรงๆ แบบนี้ถึง
+    // จะครอบคลุมทุกเคส — คิวที่ "ยังไม่เคย Start" (session_id เป็น null) จะไม่ถูก
+    // เคลียร์ทิ้ง เพราะยังไม่ผูกกับ session ไหนเลย ต้องรอผู้ใช้กด Start เอง
+    const queue = ipmQueue || newQueue;
+    const queueIsStale = queue && queue.session_id != null &&
+      !(session.state === 'running' && session.session_id === queue.session_id);
+
+    if (queueIsStale) {
+      clearAllQueuesAndForms(); // เรียก renderPartEntrySummary() ให้อยู่แล้วในตัว
+    } else {
+      // ปุ่ม Edit ของ Part Entry (canEdit) อ่านค่า session.state ตรงๆ เหมือนกัน
+      // แต่เดิมฟังก์ชันนี้ไม่เรียก renderPartEntrySummary() เลย มีแค่บาง handler
+      // ที่เรียกเอง — ทำให้เส้นทางอื่นที่อัปเดต session ผ่านตรงนี้ (เช่น
+      // loadSessionState ตอน resync) ไม่ได้เอาปุ่ม Edit ไปด้วย ปุ่มเลยค้างโชว์
+      // ผิดสถานะได้ — เรียกที่นี่ด้วยเสมอ (ยกเว้นเคส queueIsStale ที่เรียกผ่าน
+      // clearAllQueuesAndForms() ไปแล้วด้านบน กันเรียกซ้ำเฉยๆ ไม่ได้ผิดอะไร)
+      renderPartEntrySummary();
+    }
     if (typeof measurements !== 'undefined') updateStats();
   }
 
@@ -1334,7 +1368,16 @@
     if (sse) { sse.close(); sse = null; }
     setStationBadge('connecting');
     sse = new EventSource(`${API}/api/stream`);
-    sse.onopen  = () => setStationBadge('online');
+    sse.onopen  = () => {
+      setStationBadge('online');
+      // SSE ไม่มี replay/backfill เลย — ถ้าหลุดกลางคันแล้วต่อกลับมาใหม่ event
+      // ที่ backend ยิงออกไปตอนหลุด (session_complete/session_stopped ฯลฯ)
+      // จะหายไปเฉยๆ ไม่มีทางรู้ได้เลย ทำให้ Part Entry/Start button/Edit button
+      // ค้างสถานะเก่าไม่เคลียร์ให้ (อาการที่เจอ) — ทุกครั้งที่ต่อ SSE สำเร็จ (ทั้ง
+      // ครั้งแรกและตอน reconnect) resync สถานะ session จริงจาก backend ตรงๆ
+      // อีกที กันพลาด แทนที่จะเชื่อแค่ event ที่รอดมาถึง
+      loadSessionState();
+    };
     sse.onerror = () => { setStationBadge('offline'); setTimeout(connectSSE, 3000); };
 
     sse.addEventListener('measurement',      e => onNewMeasurement(parse(e)));
@@ -1411,11 +1454,13 @@
     const m = measurements.find(m => m.measurement_id === d.measurement_id);
     if (m) {
       m.image_path = d.image_path;
+      m.image_upload_failed = !!d.upload_failed;
       const row = document.querySelector(`tr[data-id="${d.measurement_id}"]`);
       if (row) {
-        row.querySelector('.img-cell').innerHTML = imgBtn(d.measurement_id);
+        row.querySelector('.img-cell').innerHTML = imgCell(m);
       }
     }
+    if (d.upload_failed) return; // ไม่มีรูปจริงให้โชว์ที่ Camera Preview
     // รูปที่เพิ่งอัปโหลดเสร็จ (จาก Agent) ถือว่าเป็นรูปล่าสุด — เอาไปโชว์ที่
     // Camera Preview เลย ไม่ต้องรอผู้ใช้กดอะไร (เป็น "live" ตามที่ขอ)
     updateCameraPreview(d.measurement_id);
@@ -1500,10 +1545,17 @@
       const data = await r.json();
       if (!r.ok) throw new Error(data.detail || 'Start failed');
 
+      // ผูกคิวนี้กับ session_id ที่เพิ่ง start สำเร็จ แล้ว save ลง localStorage
+      // ทันที — ต้องทำ "ก่อน" เรียก updateSession() เพื่อให้เช็ค queueIsStale
+      // ข้างในเห็น session_id ตรงกันพอดี (ไม่งั้นจะถูกเข้าใจผิดว่า stale แล้ว
+      // เคลียร์คิวทิ้งทันทีที่เพิ่ง start ไป) — การผูก session_id นี้คือกลไกหลักที่
+      // ทำให้รู้ทีหลังได้ว่าคิวนี้ "จบไปแล้วหรือยัง" แม้จะปิดแท็บ/refresh ไปแล้ว
+      // ก็ตาม (ดู updateSession)
+      queue.session_id = data.session_id;
+      savePartEntryState();
       updateSession({ state: 'running', session_id: data.session_id, measured_count: 0, target_count: data.target_count });
       // คิวยังคงค้างไว้ระหว่างวัด (ไม่เคลียร์ตรงนี้แล้ว)
-      // จะเคลียร์เมื่อ session จบเท่านั้น (ผ่าน clearAllQueuesAndForms)
-      renderPartEntrySummary();
+      // จะเคลียร์เมื่อ session จบเท่านั้น (ผ่าน updateSession/clearAllQueuesAndForms)
     } catch (e) { alert(`Error: ${e.message}`); }
   }
 
@@ -2019,6 +2071,18 @@
     return `<button class="img-btn-inner" title="View report" onclick="event.stopPropagation(); openReportModal(${id})"></button>`;
   }
 
+  // ── img-cell ──────────────────────────────────────────────────────────
+  // 3 สถานะ: มีรูปแล้ว (imgBtn) / Agent อัปโหลดไม่สำเร็จครบ 3 ครั้ง (badge
+  // เตือนสีแดง — ดู agent.py upload_image + main.py update_image) / ยังไม่มี
+  // รูป (เช่น manual add จาก edit.html หรือรอ Agent อัปโหลดอยู่)
+  function imgCell(m) {
+    if (m.image_path) return imgBtn(m.measurement_id);
+    if (m.image_upload_failed) {
+      return '<span class="no-img upload-failed" title="Agent อัปโหลดรูปขึ้น MinIO ไม่สำเร็จหลังลอง 3 ครั้ง">⚠ Failed</span>';
+    }
+    return '<span class="no-img">—</span>';
+  }
+
   function measPageInfoText() {
     if (measTotal === 0) return 'ไม่มีรายการ';
     const start = (measPage - 1) * MEAS_PAGE_SIZE + 1;
@@ -2055,7 +2119,7 @@
         <td>${m.value_x != null ? m.value_x.toFixed(3) : '—'}</td>
         <td>${m.value_y != null ? m.value_y.toFixed(3) : '—'}</td>
         <td><span class="result-badge ${cls}">${res}</span></td>
-        <td class="img-cell">${m.image_path ? imgBtn(m.measurement_id) : '<span class="no-img">—</span>'}</td>
+        <td class="img-cell">${imgCell(m)}</td>
         <td style="white-space:nowrap">${ts}</td>
       </tr>`;
     }).join('');
