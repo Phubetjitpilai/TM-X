@@ -84,7 +84,7 @@ class CommandRequest(BaseModel):
     action: str
     session_id: int | None = None
     template_name: str | None = None
-    number_alpl: str | None = None
+    number_alpl: int | None = None  # backend ส่งมาเป็น int (ดู main.py)
     target_count: int | None = None
 
 
