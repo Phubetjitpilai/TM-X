@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
 import socket
 import time
@@ -34,11 +33,9 @@ TMX_PORT       = int(os.getenv("TMX_PORT",      5000))
 TEMP_IMAGE_DIR = os.getenv("TEMP_IMAGE_DIR", "./Store_image_temporary")
 HB_INTERVAL    = int(os.getenv("HEARTBEAT_INTERVAL", 5))
 
-# AGENT_MODE = "mock" (ค่าเริ่มต้น เหมือนเดิม ไม่กระทบของเดิม) หรือ "real"
-# (ต่อ TM-X จริงผ่าน TCP ตาม tcp.py) — สลับได้จาก .env โดยไม่ต้องแก้โค้ด
-# ตรงกับ gap ที่ค้างไว้ใน "On the horizon": ทำ Mock Mode ให้เป็น toggleable flag
-AGENT_MODE  = os.getenv("AGENT_MODE", "mock").strip().lower()
-TMX_ROUNDS  = int(os.getenv("TMX_ROUNDS", 5))  # จำนวนรอบ trigger+GM ต่อ 1 ชิ้นงาน (หาฐานนิยม)
+# TMX_ROUNDS: จำนวนรอบ T1 (trigger) + GM (ดึงค่า) ต่อ 1 ชิ้นงาน แล้วหาฐานนิยม
+# จากทั้งหมด — ปรับได้จาก .env โดยไม่ต้องแก้โค้ด
+TMX_ROUNDS  = int(os.getenv("TMX_ROUNDS", 5))
 
 # Resolve path relative to project root
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,7 +60,7 @@ _object_queue: asyncio.Queue = asyncio.Queue()
 # หมายเหตุ: ฟังก์ชัน TCP/Serial ทั้งหมดด้านล่างนี้ (_ensure_tcp, tcp_write,
 # tcp_readline, _init_serial, send_serial) ยังเก็บไว้เหมือนเดิมทุกอย่าง
 # เผื่อย้อนกลับไปต่อ TM-X/MCU จริงในอนาคต — แต่ตอนนี้ "ไม่ได้ถูกเรียกใช้แล้ว"
-# จาก flow หลัก (ดู start_flow ด้านล่างที่เปลี่ยนไปใช้ mock_measurement_flow
+# จาก flow หลัก (ดู start_flow ด้านล่างที่ใช้ real_measurement_flow เสมอ)
 # แทน) เพราะตอนนี้ยังไม่มี TM-X/MCU จริงให้ต่อ
 _tcp_reader: Optional[asyncio.StreamReader] = None
 _tcp_writer: Optional[asyncio.StreamWriter] = None
@@ -96,7 +93,7 @@ async def tcp_readline() -> str:
     return data
 
 
-# ── Synchronous TCP to TM-X (ของจริง — ใช้ตอน AGENT_MODE=real) ───────────────
+# ── Synchronous TCP to TM-X ─────────────────────────────────────────────────
 # หมายเหตุ: พอร์ตมาจาก tcp.py ตรงๆ (socket แบบ blocking, terminator \r,
 # settimeout 5s) เพราะเป็นโค้ดที่ทดสอบกับเครื่องจริงแล้วว่าใช้งานได้ — ของเดิม
 # (_ensure_tcp/tcp_write/tcp_readline ด้านบน) ใช้ asyncio stream + terminator \n
@@ -357,7 +354,7 @@ def _cleanup_temp_images() -> None:
     log.info("Cleanup: removed %d file(s) from %s", removed, TEMP_IMAGE_DIR)
 
 
-# ── Real measurement: อ่านค่าจาก TM-X จริงผ่าน TCP (AGENT_MODE=real) ─────────
+# ── Real measurement: อ่านค่าจาก TM-X จริงผ่าน TCP ────────────────────────────
 def _wait_for_start_signal_sync() -> None:
     """แทนสัญญาณ OBJECT_READY/ปุ่ม START จาก Micro ที่ยังไม่ได้ต่อจริง —
     ให้ operator กดพิมพ์ Enter ที่ terminal ของ Agent เองก่อนแต่ละชิ้น
@@ -476,16 +473,6 @@ async def get_real_measurement() -> "MeasurementData":
 
 
 
-def _generate_mock_measurement() -> "MeasurementData":
-    """สุ่มค่า value_x/value_y แบบมั่วๆ ไว้ใช้ทดสอบ flow ทั้งระบบโดยไม่ต้องมี
-    TM-X/MCU จริงต่ออยู่ — สุ่มในช่วงที่กว้างพอจะได้เห็นทั้งผล OK และ NG
-    คละกันบ้าง (ไม่ได้ดูค่า tolerance จริงของ part เลย เพราะ Agent ไม่รู้
-    และไม่จำเป็นต้องรู้ — backend เป็นคนตัดสิน OK/NG เองอยู่แล้ว)
-    """
-    return MeasurementData(value_x=round(random.uniform(1.0, 20.0), 3),
-                            value_y=round(random.uniform(1.0, 20.0), 3))
-
-
 FAILED_MEASUREMENTS_LOG = os.path.join(_root, "failed_measurements.jsonl")
 
 
@@ -493,7 +480,7 @@ def _persist_failed_measurement(session_id, number_alpl, value_x, value_y, reaso
     """บันทึกชิ้นที่ POST เข้า backend ไม่สำเร็จ (หลัง retry ครบ 3 ครั้งแล้ว หรือ
     ถูกปฏิเสธถาวร) ลงไฟล์ local (JSON Lines) เป็น safety net — เดิมถ้า POST
     ล้มเหลว ค่าที่วัดได้จริงจากเครื่อง (โดยเฉพาะ real mode ที่กว่าจะได้มาต้อง
-    ยิง T1+GM ครบ 5 รอบ ไม่ใช่แค่ mock สุ่มใหม่ได้ฟรีๆ) จะหายไปเฉยๆ ไม่มีทาง
+    ยิง T1+GM ครบ 5 รอบ) จะหายไปเฉยๆ ไม่มีทาง
     กู้คืนนอกจากไปไล่จด log บน terminal เอง
 
     กู้คืนทีหลังได้โดยเปิดไฟล์นี้แล้วกรอกกลับเข้า Database Editor (Add
@@ -520,10 +507,9 @@ def _persist_failed_measurement(session_id, number_alpl, value_x, value_y, reaso
 
 async def post_measurement(index: int, value_x: float, value_y: float, source_label: str = "Measurement"):
     """POST ค่า value_x/value_y 1 ชิ้นไป backend (retry ได้ถึง 3 ครั้ง) + หา/
-    อัปโหลดรูปคู่กัน — logic เดิมที่เคยอยู่ใน mock_single_measurement แยกออกมา
+    อัปโหลดรูปคู่กัน — logic ที่เคยอยู่ปนกับ real_single_measurement แยกออกมา
     เป็นฟังก์ชันกลาง เพื่อให้ real_single_measurement เรียกใช้ร่วมกันได้โดยไม่
-    ต้อง copy โค้ด retry/error-handling ซ้ำอีกชุด (mock กับ real ต่างกันแค่
-    "ค่ามาจากไหน" ส่วนที่เหลือหลังจากได้ value_x/value_y แล้วเหมือนกันทุกอย่าง)
+    ต้อง copy โค้ด retry/error-handling ซ้ำ ถ้าในอนาคตมีแหล่งค่าที่วัดได้เพิ่ม
 
     คืนค่า (ok, status, session_active) เป็น tuple:
       - ok: True ถ้าบันทึกลง backend สำเร็จ, False ถ้าล้มเหลวจนต้องข้ามชิ้นนี้ไป
@@ -618,20 +604,10 @@ async def post_measurement(index: int, value_x: float, value_y: float, source_la
     return True, backend_status, True
 
 
-async def mock_single_measurement(index: int):
-    """ทำ 1 รอบของการ "วัด" แบบ mock: gen ค่า → post_measurement() เหมือนเดิม
-    ทุกอย่าง (ไม่แตะ TCP/Serial เลย) — logic POST/retry/รูป ย้ายไปรวมอยู่ที่
-    post_measurement() แล้ว ฟังก์ชันนี้เหลือแค่ "หาค่ามาจากไหน" เท่านั้น
-    คืนค่า (ok, status) เหมือน post_measurement — ดูรายละเอียดที่นั่น
-    """
-    m = _generate_mock_measurement()
-    return await post_measurement(index, m.value_x, m.value_y, source_label="Mock measurement")
-
-
 async def real_single_measurement(index: int):
     """ทำ 1 รอบของการวัดจริง: รอสัญญาณเริ่ม (แทน trigger จาก Micro ด้วย input()
     ไปก่อน) → อ่านค่า X/Y จริงจาก TM-X ครบ 5 รอบแล้วหาฐานนิยม → post_measurement()
-    เหมือน mock ทุกอย่างหลังจากได้ค่าแล้ว คืนค่า (ok, status, session_active) เหมือน post_measurement
+    คืนค่า (ok, status, session_active) — ดูรายละเอียดที่ post_measurement
     """
     print(f"\n▶ พร้อมวัดชิ้นที่ {index}/{current_target_count} — วางชิ้นงานแล้วกด Enter เพื่อเริ่ม")
     await wait_for_start_signal()
@@ -644,67 +620,6 @@ async def real_single_measurement(index: int):
         return False, None, True  # session_active=True — ปัญหาคือ TM-X ไม่ใช่ backend session
 
     return await post_measurement(index, m.value_x, m.value_y, source_label="Real measurement")
-
-
-async def mock_measurement_flow() -> None:
-    """แทนที่ flow เดิมทั้งหมด (LOAD_TEMPLATE ผ่าน TCP, รอ TEMPLATE_OK, ส่ง
-    START_CMD ผ่าน Serial, รอ OBJECT_READY จาก MCU ทีละครั้ง) ด้วย loop ที่
-    gen ค่า value_x/value_y มั่วๆ เอง แล้วยิงเข้า backend ตาม target_count
-    ครั้ง ไม่ต้องมี TM-X/MCU จริงต่ออยู่เลย
-
-    Print "ได้รับคำสั่ง Start" + template_name ก่อนเริ่ม แล้ว print "Done"
-    ตอนจบครบทุกตัวตามที่ตกลงกันไว้
-    """
-    global is_running
-
-    print(f"✅ ได้รับคำสั่ง Start — session_id={current_session_id}, template_name={current_template_name!r}")
-    log.info("Mock start: session=%s template=%r target_count=%s",
-              current_session_id, current_template_name, current_target_count)
-
-    # นับ "สำเร็จจริง" แยกจาก "ลองแล้วกี่รอบ" — ถ้าบางชิ้น POST ล้มเหลวถาวร
-    # (ดู mock_single_measurement) จะข้ามไปชิ้นถัดไปแทนที่จะหยุดทั้ง session
-    # แต่ต้องรู้ตัวเลขจริงตอนสรุปท้าย flow ไม่ใช่โกหกว่า "วัดครบ N ชิ้นแล้ว"
-    # ทั้งที่จริงมีบางชิ้นข้อมูลหายไป
-    succeeded = 0
-    target = current_target_count or 0
-    for i in range(1, target + 1):
-        if not is_running:
-            log.warning("Mock flow: ถูกสั่ง stop กลางทาง (รอบที่ %d/%d) — หยุดเลย", i, current_target_count)
-            return
-        ok, backend_status, session_active = await mock_single_measurement(i)
-        if ok:
-            succeeded += 1
-        # backend บอกว่า session ไม่ running แล้ว (เช่นถูก Stop จากที่อื่น
-        # พร้อมกัน) — วัดชิ้นถัดไปก็จะโดนปฏิเสธเหมือนกันหมด หยุดทันทีดีกว่า
-        if not session_active:
-            log.error("Mock flow: backend บอกว่า session ไม่ running แล้ว — หยุดทันที (ชิ้นที่ %d/%d)", i, target)
-            print(f"❌ Backend บอกว่า session นี้ไม่ได้ running แล้ว — หยุดวัดทันที")
-            break
-        # backend เป็นคนตัดสิน "วัดครบ session แล้ว" จริงๆ (เช็ค measured >=
-        # target ใน DB เอง) ไม่ใช่ตัวเลข target ที่ Agent จำไว้ตอน start — ถ้า
-        # backend บอกมาว่า complete แล้ว หยุด loop ทันที ไม่ต้องรอนับของตัวเอง
-        # (กันเคสตัวเลขสองฝั่งไม่ตรงกัน เช่น Agent เคย restart กลาง session)
-        if backend_status == "complete":
-            log.info("Mock flow: backend แจ้งว่า session complete แล้ว (ชิ้นที่ %d/%d) — หยุด loop ทันที", i, target)
-            break
-
-    async with _state_lock:
-        is_running = False
-
-    # รอ upload รูปที่ยังค้างอยู่ให้เสร็จก่อน cleanup (เหมือน flow จริงเดิม)
-    if _pending_uploads:
-        log.info("Waiting for %d upload(s) to finish before cleanup…", len(_pending_uploads))
-        await asyncio.gather(*_pending_uploads, return_exceptions=True)
-    _cleanup_temp_images()
-
-    if succeeded == target:
-        print(f"✅ Done — วัดครบ {target} ชิ้นแล้ว (session_id={current_session_id})")
-    else:
-        print(f"⚠️ Done — วัดสำเร็จ {succeeded}/{target} ชิ้น "
-              f"({target - succeeded} ชิ้นบันทึกไม่สำเร็จ ดู log ด้านบน) "
-              f"(session_id={current_session_id})")
-    log.info("Mock flow done: session=%s สำเร็จ %d/%d", current_session_id, succeeded, target)
-
 
 
 async def real_measurement_flow() -> None:
@@ -799,7 +714,7 @@ async def real_measurement_flow() -> None:
 
 # ── Object-ready consumer loop ────────────────────────────────────────────────
 # หมายเหตุ: loop นี้ (กับ serial_reader_loop ด้านล่าง) ยังรันอยู่เหมือนเดิม
-# แต่ตอนนี้ "ไม่มีอะไรมา put เข้า _object_queue แล้ว" เพราะ mock_measurement_flow
+# แต่ตอนนี้ "ไม่มีอะไรมา put เข้า _object_queue แล้ว" เพราะ real_measurement_flow
 # ไม่ได้รอสัญญาณจาก Serial อีกต่อไป — เก็บไว้เผื่อย้อนกลับไปใช้ของจริง
 async def object_ready_consumer() -> None:
     """Single consumer — processes OBJECT_READY one at a time from the queue."""
@@ -818,38 +733,32 @@ async def object_ready_consumer() -> None:
 
 # ── Start / Stop flows ────────────────────────────────────────────────────────
 async def start_flow() -> None:
-    """เลือก flow ตาม AGENT_MODE (.env):
-      - AGENT_MODE=mock (ค่าเริ่มต้น) → mock_measurement_flow() เหมือนเดิมทุก
-        อย่าง ไม่กระทบของเดิมเลยถ้าไม่ตั้งค่าอะไรเพิ่ม
-      - AGENT_MODE=real → real_measurement_flow() ต่อ TM-X จริงผ่าน TCP ตาม
-        tcp.py (PW โหลด template ที่ backend สั่ง, T1+GM 5 รอบหาฐานนิยม)
+    """Start จาก Backend → real_measurement_flow() ต่อ TM-X จริงผ่าน TCP ตาม
+    tcp.py เสมอ (PW โหลด template ที่ backend สั่ง, T1+GM 5 รอบหาฐานนิยม)
     ฟังก์ชัน tcp_write/tcp_readline (async stream แบบเก่า) และ send_serial
-    ด้านบนยังเก็บไว้เผื่ออนาคตเหมือนเดิม ไม่ได้ใช้ในทั้งสอง flow นี้
+    ด้านบนยังเก็บไว้เผื่ออนาคตเหมือนเดิม ไม่ได้ใช้ใน flow นี้
     """
-    if AGENT_MODE == "real":
-        await real_measurement_flow()
-    else:
-        await mock_measurement_flow()
+    await real_measurement_flow()
 
 
 async def stop_flow() -> None:
     """Stop จาก Backend (กดปุ่ม Stop บนเว็บ → POST /command action="stop")
 
-    1. ตั้ง is_running=False — loop ใน mock_measurement_flow/real_measurement_flow
-       จะเห็นตอนขึ้นรอบถัดไปแล้วหยุดเอง (ถ้า loop กำลังรอ input()/T1/GM อยู่
-       พอดี จะหยุดไม่ทันที ต้องรอรอบปัจจุบันจบก่อน — ข้อจำกัดของการ interrupt
-       blocking I/O กลางคันด้วย asyncio ธรรมดา)
-    2. ถ้าอยู่ใน AGENT_MODE=real และ TM-X ต่ออยู่จริง ให้ยิง "S0" ไปทันทีเลย
-       ตามที่ Ball ระบุไว้ (ข้อ 2) — ยิงซ้ำกับที่ real_measurement_flow จะส่ง
-       S0 อีกทีตอน loop จบตามปกติได้ไม่เป็นไร (TM-X รับ S0 ซ้ำได้ ไม่พัง) แต่
-       ทำให้ "หยุดจริง" เร็วขึ้นแทนที่จะรอ loop จบเองอย่างเดียว
+    1. ตั้ง is_running=False — loop ใน real_measurement_flow จะเห็นตอนขึ้นรอบ
+       ถัดไปแล้วหยุดเอง (ถ้า loop กำลังรอ input()/T1/GM อยู่พอดี จะหยุดไม่
+       ทันที ต้องรอรอบปัจจุบันจบก่อน — ข้อจำกัดของการ interrupt blocking I/O
+       กลางคันด้วย asyncio ธรรมดา)
+    2. ถ้า TM-X ต่ออยู่จริง ให้ยิง "S0" ไปทันทีเลย ตามที่ Ball ระบุไว้ (ข้อ 2)
+       — ยิงซ้ำกับที่ real_measurement_flow จะส่ง S0 อีกทีตอน loop จบตามปกติ
+       ได้ไม่เป็นไร (TM-X รับ S0 ซ้ำได้ ไม่พัง) แต่ทำให้ "หยุดจริง" เร็วขึ้น
+       แทนที่จะรอ loop จบเองอย่างเดียว
     """
     global is_running
-    log.info("Stop flow: หยุด measurement flow (mode=%s)", AGENT_MODE)
+    log.info("Stop flow: หยุด measurement flow")
     async with _state_lock:
         is_running = False
 
-    if AGENT_MODE == "real" and _tmx_sock is not None:
+    if _tmx_sock is not None:
         try:
             resp = await tmx_send_command("S0")
             log.info("Stop flow: ส่ง S0 ทันที -> %r", resp)
@@ -947,7 +856,7 @@ async def command(req: CommandRequest):
 async def simulate_object_ready():
     """Simulate an OBJECT_READY signal from MCU — for testing without real hardware.
 
-    หมายเหตุ: endpoint นี้ไม่มีความหมายแล้วตอนนี้ เพราะ mock_measurement_flow
+    หมายเหตุ: endpoint นี้ไม่มีความหมายแล้วตอนนี้ เพราะ real_measurement_flow
     ไม่รอสัญญาณ OBJECT_READY อีกต่อไป (มันวน loop เองตาม target_count เลย) —
     เก็บไว้เผื่อย้อนกลับไปใช้ของจริงในอนาคต
     """
