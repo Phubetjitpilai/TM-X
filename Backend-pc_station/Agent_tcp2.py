@@ -97,5 +97,6 @@ async def command(req: CommandRequest):
 
 
 if __name__ == "__main__":
-    print("Agent (minimal) กำลังรอคำสั่ง Start จาก Backend ที่ port 6000...")
-    uvicorn.run(http_app, host="0.0.0.0", port=6000)
+    # port ต้องตรงกับ AGENT_PORT ใน main.py ของ backend (default 9998)
+    print("Agent (minimal) กำลังรอคำสั่ง Start จาก Backend ที่ port 9998...")
+    uvicorn.run(http_app, host="0.0.0.0", port=9998)
