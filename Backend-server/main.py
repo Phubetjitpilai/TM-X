@@ -8,8 +8,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
 from io import StringIO
 from typing import Any, Dict, List, Optional
 
@@ -17,14 +18,12 @@ import httpx
 import pandas as pd
 import pymysql
 import pymysql.cursors
-import urllib3
 from pymysql.constants import CLIENT
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from minio import Minio
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -36,7 +35,9 @@ DB_CONFIG = dict(
     user=os.getenv("DB_USER", "root"),
     password=os.getenv("DB_PASSWORD", ""),
     database=os.getenv("DB_NAME", "tmx_db"),
-    port=int(os.getenv("DB_PORT", 3307)),
+    # default 3306 = port ปกติของ MySQL ที่ติดตั้งบนเครื่องโดยตรง (เดิม 3307
+    # คือ port ที่ map ออกมาจาก Docker container ซึ่งเลิกใช้แล้ว)
+    port=int(os.getenv("DB_PORT", 3306)),
     cursorclass=pymysql.cursors.DictCursor,
     autocommit=True,
     # CLIENT.FOUND_ROWS: ค่า default ของ MySQL/pymysql คือ cur.rowcount หลัง UPDATE
@@ -48,15 +49,35 @@ DB_CONFIG = dict(
     client_flag=CLIENT.FOUND_ROWS,
 )
 
-MINIO_ENDPOINT  = os.getenv("MINIO_ENDPOINT",  "localhost:9000")
-MINIO_ACCESS    = os.getenv("MINIO_ACCESS_KEY", "admin")
-MINIO_SECRET    = os.getenv("MINIO_SECRET_KEY")
-if not MINIO_SECRET:
-    raise ValueError("MINIO_SECRET_KEY environment variable is required")
-MINIO_BUCKET    = "tmx-images"
+# หมายเหตุ (architecture ใหม่): เลิกใช้ MinIO แล้ว — รูปภาพเก็บเป็นไฟล์จริงใน
+# โฟลเดอร์บนเครื่อง PC ที่รัน backend นี้เอง ดีไซน์สรุปแล้ว (ดู
+# POST /api/measurements/{id}/image-upload ด้านล่าง):
+#   Agent (Pi) รับภาพจาก TM-X ผ่าน FTP ของตัวเองเก็บไว้ที่ Store_image_temporary
+#   ก่อน แล้วอัปโหลดไฟล์จริง (multipart) มาที่ endpoint นี้ผ่าน HTTP — backend
+#   เป็นคนตัดสินใจ path ปลายทางเอง: ALPL_IMAGE_DIR/<package_size>/<filename>
+#   (ไม่ใช่ Agent ส่ง path ตรงๆ มาแบบเดิมสมัย MinIO เพราะ Agent อยู่คนละเครื่อง
+#   กับ backend แล้ว path ฝั่ง Agent ไม่มีความหมายกับ backend เลย)
+ALPL_IMAGE_DIR = os.getenv(
+    "ALPL_IMAGE_DIR",
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ALPL")),
+)
 
+
+def _safe_folder_name(name: str) -> str:
+    """กันชื่อ package_size ที่อาจมีอักขระใช้เป็นชื่อโฟลเดอร์ไม่ได้ (/, \\, :, ฯลฯ)
+    หรือเป็นค่าว่าง/None — แทนที่ด้วย "_" กัน path traversal และกัน mkdir พัง"""
+    cleaned = re.sub(r'[\\/:*?"<>|]', "_", (name or "").strip())
+    return cleaned or "unknown_package"
+
+# AGENT_HOST: เดิม hardcode เป็น "localhost" ตรงๆ (สมมติว่า Agent รันอยู่เครื่อง
+# เดียวกับ Backend เสมอ) — ตอนนี้ Agent อาจย้ายไปรันบนเครื่องแยก (เช่น Raspberry
+# Pi ที่ทำหน้าที่คุยกับ sensor/MCU โดยตรง) จึงต้องดึงจาก .env แทน ถ้าไม่ตั้งค่า
+# ใน .env จะ fallback เป็น "localhost" เหมือนเดิมทุกประการ (เทสต์บน PC เครื่อง
+# เดียวได้ปกติ ไม่กระทบ) พอมี Pi จริงแค่ตั้ง AGENT_HOST=<IP ของ Pi> ใน .env
+# ไม่ต้องแก้โค้ดจุดนี้อีก
+AGENT_HOST      = os.getenv("AGENT_HOST", "localhost")
 AGENT_PORT      = int(os.getenv("AGENT_PORT", 9998))
-AGENT_BASE_URL  = f"http://localhost:{AGENT_PORT}"
+AGENT_BASE_URL  = f"http://{AGENT_HOST}:{AGENT_PORT}"
 
 # heartbeat: Agent ยิง POST /api/heartbeat มาทุก HEARTBEAT_INTERVAL วิ ระหว่างที่
 # ยังรันอยู่ (ดู agent.py heartbeat_loop) — heartbeat_checker() ด้านล่างเช็คเป็น
@@ -72,14 +93,14 @@ log = logging.getLogger(__name__)
 # ── SSE broadcast queue ──────────────────────────────────────────────────────
 subscribers: List[asyncio.Queue] = []
 
-# ── In-memory queue state สำหรับ session แบบ IPM/New ─────────────────────────
+# ── In-memory queue state สำหรับ session แบบ IPM/New/Rework ──────────────────
 # เก็บ "คิว" ALPL + ตำแหน่งปัจจุบันของ session ที่เริ่มจาก Part Entry card
-# (โหมด IPM/New) — เป็นตัวแปร memory ธรรมดา ไม่ใช่ column ใน DB เลย เพราะ
+# (โหมด IPM/New/Rework) — เป็นตัวแปร memory ธรรมดา ไม่ใช่ column ใน DB เลย เพราะ
 # schema ของ `sessions` ไม่มีที่เก็บลำดับ ALPL ทั้งคิว มีแค่ number_alpl ตัวเดียว
 # (ที่เราใส่เป็น ALPL ตัวแรกในคิวไปแทน) — ถ้า server restart กลางที่ session
 # กำลัง running อยู่ คิวนี้จะหาย (ยอมรับความเสี่ยงนี้ได้ตามที่คุยกันไว้)
 #
-# โครงสร้าง: { session_id: {"entry_mode": "IPM"|"New", "queue": [1011, 1002, ...],
+# โครงสร้าง: { session_id: {"entry_mode": "IPM"|"New"|"Rework", "queue": [1011, 1002, ...],
 #                            "position": 0} }
 session_queues: Dict[int, Dict[str, Any]] = {}
 
@@ -99,7 +120,7 @@ async def push_event(event_type: str, data: dict) -> None:
     log.info("SSE ▶ %s: %s", event_type, payload)
 
 
-# ── DB / MinIO helpers ───────────────────────────────────────────────────────
+# ── DB helpers ───────────────────────────────────────────────────────────────
 def get_db():
     """เปิด MySQL connection ใหม่สำหรับ 1 request
 
@@ -121,53 +142,7 @@ def get_db():
         raise HTTPException(503, f"เชื่อมต่อฐานข้อมูลไม่สำเร็จ: {exc}")
 
 
-def get_minio() -> Minio:
-    """สร้าง MinIO client สำหรับเก็บ/ดึงรูปภาพการตรวจสอบ (inspection images)
-
-    ทำไมต้องตั้ง connect timeout สั้น: ถ้า MinIO ล่มหรือเข้าไม่ถึง อยากให้ request fail
-    เร็ว (ภายในไม่กี่วินาที) แทนที่จะค้างเป็นนาทีจนไป block event loop ของแอป
-    """
-    http_client = urllib3.PoolManager(
-        timeout=urllib3.Timeout(connect=3, read=10),
-        retries=urllib3.Retry(total=1, backoff_factor=0),
-    )
-    return Minio(
-        MINIO_ENDPOINT,
-        access_key=MINIO_ACCESS,
-        secret_key=MINIO_SECRET,
-        secure=False,
-        http_client=http_client,
-    )
-
-
-def ensure_bucket() -> None:
-    """สร้าง MinIO bucket สำหรับเก็บรูป measurement ถ้ายังไม่มี
-
-    ทำไม: เหตุการณ์นี้ต้องเกิดแค่ครั้งเดียว (เช่นรันครั้งแรก หรือ MinIO instance ใหม่)
-    จึงเช็คก่อนว่ามี bucket อยู่แล้วหรือยัง ก่อนจะสร้าง ไม่ใช่สร้างทับซ้ำทุกครั้ง
-    """
-    mc = get_minio()
-    if not mc.bucket_exists(MINIO_BUCKET):
-        mc.make_bucket(MINIO_BUCKET)
-        log.info("Created MinIO bucket: %s", MINIO_BUCKET)
-
-
 # ── Lifespan ─────────────────────────────────────────────────────────────────
-async def _init_bucket_bg() -> None:
-    """พยายามสร้าง MinIO bucket แบบ background — ไม่ block การ startup ของแอป
-
-    ทำไม: ถ้า MinIO เริ่มช้าหรือเข้าไม่ถึงชั่วคราว เราไม่อยากให้ทั้งแอป FastAPI
-    boot ไม่ขึ้นเพราะเรื่องนี้ จึงรันเป็น fire-and-forget task ที่มี timeout สั้นๆ
-    ของตัวเอง ถ้า MinIO มีปัญหาก็แค่ log warning ไม่ทำให้ server crash
-    """
-    try:
-        loop = asyncio.get_event_loop()
-        await asyncio.wait_for(loop.run_in_executor(None, ensure_bucket), timeout=6)
-        log.info("MinIO bucket ready")
-    except Exception as exc:
-        log.warning("MinIO init failed (not fatal): %s", exc)
-
-
 async def _reload_session_queues() -> None:
     """โหลด session_queues กลับเข้า memory จากคอลัมน์ sessions.queue_state
 
@@ -256,12 +231,11 @@ async def heartbeat_checker() -> None:
 async def lifespan(app: FastAPI):
     """Hook ตอน FastAPI เริ่มทำงาน (startup) และตอนปิด (shutdown)
 
-    ทำไม: ตรงนี้คือจุดที่ background task (สร้าง MinIO bucket, heartbeat_checker)
-    ถูกสั่งให้เริ่มทำงานตอนแอป boot แทนที่จะไปสั่งเริ่มภายใน request handler ส่วน
+    ทำไม: ตรงนี้คือจุดที่ background task (heartbeat_checker) ถูกสั่งให้เริ่ม
+    ทำงานตอนแอป boot แทนที่จะไปสั่งเริ่มภายใน request handler ส่วน
     _reload_session_queues() ต้อง await ให้เสร็จก่อน yield เพราะต้องกู้คืนคิว
     ให้ครบก่อนรับ request
     """
-    asyncio.create_task(_init_bucket_bg())       # fire-and-forget, never blocks
     asyncio.create_task(heartbeat_checker())     # fire-and-forget, never blocks
     await _reload_session_queues()               # ต้องเสร็จก่อนรับ request
     yield
@@ -417,7 +391,7 @@ async def _notify_agent_start(
 
 @app.post("/api/session/start")
 async def start_session(request: Request):
-    """เริ่ม session การวัดใหม่ จาก Part Entry card (โหมด IPM หรือ New)
+    """เริ่ม session การวัดใหม่ จาก Part Entry card (โหมด IPM, New หรือ Rework)
 
     **กรณี Measure_Type == "New"** (ลงทะเบียน Part ใหม่ + วัดในรอบเดียว):
       1. Insert Part เฉพาะ "ตัวแรก" ในคิวก่อน (ต้องทำก่อน insert session เพราะ
@@ -437,7 +411,18 @@ async def start_session(request: Request):
       3. เก็บคิวไว้ใน session_queues เหมือนกัน
       4. Notify Agent
 
-    ทั้ง 2 กรณี — Agent ไม่ต้องรู้ความต่างเลย ได้รับ payload หน้าตาเดียวกัน
+    **กรณี Measure_Type == "Rework"** (งานที่เคยลงทะเบียนผ่าน New แล้ว ไม่ผ่าน
+    ถูกส่งไป Rework แล้วส่งกลับมาวัดใหม่):
+      1. รับได้ทีละ 1 ALPL เท่านั้น (ต่างจาก New/IPM ที่รับเป็นคิวได้) — ALPL
+         ต้องมี Part row อยู่แล้วจริง (ไม่งั้น 404 บอกให้ไปลงทะเบียนที่ New ก่อน)
+      2. Update Part row เดิม (ไม่ insert ใหม่) ด้วยค่าที่ผู้ใช้กรอก/แก้ในฟอร์ม
+         Rework — ฟอร์มนี้ auto-fill ข้อมูลเดิมของ ALPL มาให้แทบทุกช่องแล้ว
+         ยกเว้น Receive Date ที่บังคับกรอกใหม่เสมอ (วันที่รับกลับมาจริง)
+      3. Query template_name จาก DB หลัง update (เผื่อ package_size ถูกแก้)
+      4. Insert sessions row → ได้ session_id, เก็บคิวไว้ (แค่ 1 ALPL) แล้ว
+         notify Agent เหมือนโหมดอื่น
+
+    ทั้ง 3 กรณี — Agent ไม่ต้องรู้ความต่างเลย ได้รับ payload หน้าตาเดียวกัน
     (action/session_id/template_name/target_count/number_alpl ตัวแรก) ส่วน
     การ map ALPL ตัวต่อๆไปในคิวเข้ากับ measurement ที่จะตามมา เป็นเรื่องที่
     backend จัดการเองทั้งหมดผ่าน session_queues (ดู create_measurement)
@@ -451,8 +436,8 @@ async def start_session(request: Request):
     log.info("📥 ได้รับ payload จาก /api/session/start:\n%s", json.dumps(data, ensure_ascii=False, indent=2))
 
     measure_type = data.get("Measure_Type")
-    if measure_type not in ("New", "IPM"):
-        raise HTTPException(400, "Measure_Type ต้องเป็น 'New' หรือ 'IPM'")
+    if measure_type not in ("New", "IPM", "Rework"):
+        raise HTTPException(400, "Measure_Type ต้องเป็น 'New', 'IPM' หรือ 'Rework'")
 
     # parse number_alpl อย่างระมัดระวัง — ถ้า key หายไปหรือมีค่าที่แปลงเป็น
     # int ไม่ได้ จะได้ KeyError/ValueError ซึ่งเป็น raw exception (ไม่ใช่
@@ -507,6 +492,30 @@ async def start_session(request: Request):
                     except pymysql.MySQLError as exc:
                         raise HTTPException(409, f"Insert Part แรกในคิวไม่สำเร็จ: {exc}")
                     template_name = data.get("template_name")
+                elif measure_type == "Rework":
+                    # Rework: งานที่เคยลงทะเบียนผ่าน New แล้ว แต่ไม่ผ่าน ถูกส่งไป
+                    # Rework แล้วส่งกลับมาวัดใหม่ — ALPL ต้องมี Part row อยู่แล้ว
+                    # จริง (ห้ามใช้กับ ALPL ที่ไม่เคยลงทะเบียน ต้องไปสร้างที่ New
+                    # ก่อน) จำกัดไว้ทีละ 1 ALPL เท่านั้น เพราะฟอร์ม Rework แสดง/
+                    # แก้ config ของ Part เดิม 1 ตัวเป๊ะๆ (ไม่ใช่ config กลางที่ใช้
+                    # ซ้ำกับหลาย ALPL แบบ New — ALPL แต่ละตัวที่ Rework กลับมามี
+                    # ประวัติเดิมของตัวเองไม่เหมือนกัน จะ share config เดียวไม่ได้)
+                    if len(alpl_queue) != 1:
+                        raise HTTPException(400, "Rework รองรับทีละ 1 ALPL เท่านั้น")
+                    cur.execute("SELECT 1 FROM parts WHERE number_alpl = %s", (first_alpl,))
+                    if not cur.fetchone():
+                        raise HTTPException(
+                            404,
+                            f"ALPL {first_alpl} ยังไม่เคยลงทะเบียน — ไปลงทะเบียนที่แท็บ New ก่อน",
+                        )
+                    try:
+                        _update_part_row(cur, first_alpl, data)
+                    except pymysql.MySQLError as exc:
+                        raise HTTPException(409, f"Update Part สำหรับ Rework ไม่สำเร็จ: {exc}")
+                    # ใช้ query แบบเดียวกับ IPM (ไม่เชื่อ template_name จาก payload)
+                    # เพราะ package_size อาจถูกแก้ระหว่าง Rework — เอาค่าล่าสุดจาก
+                    # DB หลัง update เสมอ กันส่ง template ผิดตัวไปให้ Agent
+                    template_name = _get_template_name_for_ipm(cur, first_alpl)
                 else:
                     # IPM: ไม่ insert parts เลย แค่ query หา template_name
                     template_name = _get_template_name_for_ipm(cur, first_alpl)
@@ -533,10 +542,11 @@ async def start_session(request: Request):
             "position": 0,
             "operator": data.get("Operator"),
             "note": data.get("Note"),
-            # เก็บ config เดิมของ New ไว้ (part_number/handler/vendor/category/
+            # เก็บ config เดิมของ New ไว้ (part_number/handler/vendor/
             # package_size/owner ฯลฯ) ให้ create_measurement เอาไป insert Part
-            # ตัวถัดๆไปในคิวแบบ lazy ทีละตัวตอนวัดจริง — None ถ้าเป็น IPM (ไม่ต้อง
-            # insert Part ใหม่เลย เพราะ IPM ใช้ Part ที่ลงทะเบียนไว้แล้วทั้งหมด)
+            # ตัวถัดๆไปในคิวแบบ lazy ทีละตัวตอนวัดจริง — None ถ้าเป็น IPM/Rework
+            # (IPM ใช้ Part ที่ลงทะเบียนไว้แล้วทั้งหมด, Rework จำกัดทีละ 1 ALPL ที่
+            # update ไปเรียบร้อยแล้วข้างบน ไม่มี ALPL ตัวถัดไปในคิวให้ insert lazy)
             "new_part_config": data if measure_type == "New" else None,
         }
         session_queues[session_id] = queue_state
@@ -639,7 +649,7 @@ async def heartbeat(req: HeartbeatRequest):
 # ══════════════════════════════════════════════════════════════════════════════
 # Dropdown ทุกตัวนี้เป็นแบบ "ปิด" (closed) — frontend เลือกได้เฉพาะค่าที่มีอยู่
 # จริงใน DB เท่านั้น ไม่มีช่องพิมพ์เพิ่มค่าใหม่ในฟอร์ม ถ้าต้องเพิ่ม
-# owner/vendor/handler/category/operator ใหม่ ต้อง insert ตรงเข้า DB เอง
+# owner/vendor/handler/operator ใหม่ ต้อง insert ตรงเข้า DB เอง
 # (ตามที่คุยกันไว้ — ไม่ทำ "add new" inline ในฟอร์ม)
 @app.get("/api/operators")
 async def list_operators():
@@ -685,17 +695,6 @@ async def list_handlers():
         db.close()
 
 
-@app.get("/api/categories")
-async def list_categories():
-    db = get_db()
-    try:
-        with db.cursor() as cur:
-            cur.execute("SELECT category_id, category_name FROM category ORDER BY category_name")
-            return cur.fetchall()
-    finally:
-        db.close()
-
-
 @app.get("/api/package-sizes")
 async def list_package_sizes():
     """คืนรายการ package_size ทั้งหมด พร้อม nominal/tolerance/template_name —
@@ -719,14 +718,16 @@ async def list_package_sizes():
 # Parts endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 # SELECT ที่ join parts กับทุกตาราง lookup ไว้ในที่เดียว — ใช้ร่วมกันทั้ง
-# list_parts และ get_part เพื่อให้ response มีทั้งชื่อ (handler/vendor/category/
+# list_parts และ get_part เพื่อให้ response มีทั้งชื่อ (handler/vendor/
 # owner/package_size) และรายละเอียดของ package_size (nominal/tolerance/
-# template_name) ไม่ใช่แค่ id เปล่าๆ ที่ frontend เอาไปแสดงตรงๆ ไม่ได้
+# template_name) ไม่ใช่แค่ id เปล่าๆ ที่ frontend เอาไปแสดงตรงๆ ไม่ได้ รวม
+# recieve_date ด้วย — ใช้ prefill ฟอร์ม Rework (auto-fill ข้อมูลเดิมของ ALPL
+# ที่กรอกกลับเข้ามา ยกเว้น recieve_date ที่ต้องเว้นว่างให้กรอกใหม่)
 PARTS_SELECT = """
     SELECT p.part_id, p.number_alpl, p.part_number, p.description, p.po_number,
+           p.recieve_date   AS recieve_date,
            h.handler_name   AS handler,
            v.vendor_name    AS vendor,
-           c.category_name  AS category,
            o.owner_name     AS owner,
            ps.package_size  AS package_size,
            ps.nominal_x     AS nominal_x,
@@ -737,7 +738,6 @@ PARTS_SELECT = """
     FROM parts p
     LEFT JOIN handler h       ON p.handler_id = h.handler_id
     LEFT JOIN vendor v        ON p.vendor_id = v.vendor_id
-    LEFT JOIN category c      ON p.category_id = c.category_id
     LEFT JOIN owner o         ON p.owner_id = o.owner_id
     LEFT JOIN package_size ps ON p.package_size_id = ps.package_size_id
 """
@@ -747,7 +747,7 @@ def _lookup_id(cur, table: str, id_col: str, name_col: str, value: Optional[str]
     """แปลงชื่อ (เช่น vendor_name ที่ frontend ส่งมาจาก dropdown) เป็น id
     (เช่น vendor_id) จากตาราง lookup ที่เกี่ยวข้อง
 
-    ทำไม: dropdown ฝั่ง frontend (Operator/Owner/Vendor/Handler/Category/
+    ทำไม: dropdown ฝั่ง frontend (Operator/Owner/Vendor/Handler/
     Package Size) เป็น dropdown "ปิด" — เลือกได้เฉพาะค่าที่มีอยู่แล้วใน DB
     เท่านั้น ไม่มีช่องพิมพ์ค่าใหม่ ดังนั้นค่าที่ส่งเข้ามาควรมีอยู่จริงเสมอ แต่ยัง
     defensive เช็คไว้กันกรณี frontend ค้างข้อมูลเก่า/ผิดพลาด — ถ้าหาไม่เจอ
@@ -785,22 +785,26 @@ def _block_if_session_running(cur, action: str) -> None:
 class PartCreate(BaseModel):
     # schema ใหม่: parts ไม่เก็บ nominal/tolerance/template_name ตรงๆ อีกต่อไป —
     # ย้ายไปอยู่ใน package_size ทั้งหมด (ดู init.sql) เลือก package_size เดียว
-    # ก็ map ค่าพวกนี้ให้อัตโนมัติ ส่วน handler/vendor/category/owner ตอนนี้เป็น
+    # ก็ map ค่าพวกนี้ให้อัตโนมัติ ส่วน handler/vendor/owner ตอนนี้เป็น
     # FK ไป lookup table — frontend ส่งมาเป็น "ชื่อ" (string จาก dropdown) แล้ว
     # backend resolve เป็น id เอง (ดู _lookup_id)
     #
     # part_number เป็น Optional เพราะตอน IPM เจอ ALPL ที่ยังไม่เคยลงทะเบียน
     # (ดู POST /api/session/start) จะลงทะเบียน part ใหม่แบบขั้นต่ำผ่าน endpoint
     # นี้ — มีแค่ number_alpl + package_size เท่านั้น ยังไม่รู้ part_number จริง
+    #
+    # recieve_date เป็น Optional เหมือนกัน — ถ้าไม่ส่งมา (None/ไม่มี key) จะปล่อย
+    # ให้ DEFAULT CURRENT_TIMESTAMP ของคอลัมน์ recieve_date ทำงานแทน (ดู
+    # _insert_part_row) ฟอร์ม New ส่งมาเป็น optional, ฟอร์ม Rework บังคับกรอกเสมอ
     number_alpl:   int
     part_number:   Optional[str] = None
     handler:       Optional[str] = None
     description:   Optional[str] = None
     vendor:        Optional[str] = None
     po_number:     Optional[int] = None
-    category:      Optional[str] = None
     package_size:  Optional[str] = None
     owner:         Optional[str] = None
+    recieve_date:  Optional[str] = None
 
 
 @app.get("/api/parts")
@@ -852,7 +856,7 @@ async def list_parts(
 
 @app.get("/api/parts/{part_id}")
 async def get_part(part_id: int):
-    """คืน config ของ part 1 ตัวตาม ALPL number (รวมชื่อ handler/vendor/category/
+    """คืน config ของ part 1 ตัวตาม ALPL number (รวมชื่อ handler/vendor/
     owner/package_size ที่ join มาจาก lookup table แล้ว ไม่ใช่แค่ id)"""
     db = get_db()
     try:
@@ -868,8 +872,8 @@ async def get_part(part_id: int):
 
 def _insert_part_row(cur, number_alpl: int, config: Dict[str, Any]) -> None:
     """Insert 1 row ลง table `parts` โดยใช้ number_alpl ที่ระบุ + field อื่นจาก
-    `config` (dict ของ field part_number/handler/vendor/category/package_size/
-    owner ฯลฯ) — handler/vendor/category/package_size/owner รับมาเป็น "ชื่อ"
+    `config` (dict ของ field part_number/handler/vendor/package_size/
+    owner ฯลฯ) — handler/vendor/package_size/owner รับมาเป็น "ชื่อ"
     (ตรงกับค่าที่เลือกจาก dropdown ฝั่ง frontend) แล้ว resolve เป็น id ก่อน insert
 
     ใช้ร่วมกันทั้งจาก endpoint POST /api/parts ปกติ, จาก flow ของ New queue ที่
@@ -878,18 +882,56 @@ def _insert_part_row(cur, number_alpl: int, config: Dict[str, Any]) -> None:
     """
     handler_id      = _lookup_id(cur, "handler",      "handler_id",      "handler_name",  config.get("handler"))
     vendor_id       = _lookup_id(cur, "vendor",        "vendor_id",       "vendor_name",   config.get("vendor"))
-    category_id     = _lookup_id(cur, "category",      "category_id",     "category_name", config.get("category"))
+    owner_id        = _lookup_id(cur, "owner",         "owner_id",        "owner_name",    config.get("owner"))
+    package_size_id = _lookup_id(cur, "package_size",  "package_size_id", "package_size",  config.get("package_size"))
+
+    columns = [
+        "number_alpl", "part_number", "handler_id", "description",
+        "vendor_id", "po_number", "package_size_id", "owner_id",
+    ]
+    values: List[Any] = [
+        number_alpl, config.get("part_number"), handler_id, config.get("description"),
+        vendor_id, config.get("po_number"), package_size_id, owner_id,
+    ]
+    # recieve_date: ใส่ column นี้เฉพาะตอนที่ config มีค่ามาจริง (ช่อง Receive
+    # Date ในฟอร์ม New — optional) ถ้าไม่ส่งมา/เป็นค่าว่าง ปล่อยให้ column ไม่
+    # อยู่ใน INSERT statement เลย เพื่อให้ DEFAULT CURRENT_TIMESTAMP ของ
+    # recieve_date ทำงานแทน (ถ้า insert ค่า NULL ตรงๆ DEFAULT จะไม่ทำงาน)
+    recieve_date = config.get("recieve_date")
+    if recieve_date:
+        columns.append("recieve_date")
+        values.append(recieve_date)
+
+    placeholders = ", ".join(["%s"] * len(values))
+    cur.execute(
+        f"INSERT INTO parts ({', '.join(columns)}) VALUES ({placeholders})",
+        tuple(values),
+    )
+
+
+def _update_part_row(cur, number_alpl: int, config: Dict[str, Any]) -> None:
+    """Update 1 row ที่มีอยู่แล้วใน table `parts` (ตรงข้ามกับ _insert_part_row)
+
+    ใช้เฉพาะกรณี Rework: ALPL นี้เคยผ่าน New มาแล้ว (มี Part row อยู่จริง) แต่
+    งานไม่ผ่าน ถูกส่งไป Rework แล้วส่งกลับมาวัดใหม่ — ฟอร์ม Rework auto-fill
+    ทุกช่องด้วยข้อมูลเดิมของ ALPL นี้ไว้ให้แล้ว (ดู GET /api/parts/{part_id})
+    ยกเว้น recieve_date ที่ผู้ใช้ต้องกรอกวันที่รับกลับมาใหม่เอง — Save จึง
+    เขียนทับ row เดิม (WHERE number_alpl = %s) แทนที่จะ insert row ใหม่ซ้อน
+    ขึ้นมา ซึ่งจะชนกับ UNIQUE constraint ของ number_alpl ทันที
+    """
+    handler_id      = _lookup_id(cur, "handler",      "handler_id",      "handler_name",  config.get("handler"))
+    vendor_id       = _lookup_id(cur, "vendor",        "vendor_id",       "vendor_name",   config.get("vendor"))
     owner_id        = _lookup_id(cur, "owner",         "owner_id",        "owner_name",    config.get("owner"))
     package_size_id = _lookup_id(cur, "package_size",  "package_size_id", "package_size",  config.get("package_size"))
     cur.execute(
-        "INSERT INTO parts "
-        "(number_alpl, part_number, handler_id, description, vendor_id, "
-        " po_number, category_id, package_size_id, owner_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "UPDATE parts SET part_number = %s, handler_id = %s, description = %s, "
+        "vendor_id = %s, po_number = %s, package_size_id = %s, owner_id = %s, "
+        "recieve_date = %s "
+        "WHERE number_alpl = %s",
         (
-            number_alpl,
             config.get("part_number"), handler_id, config.get("description"),
-            vendor_id, config.get("po_number"), category_id, package_size_id, owner_id,
+            vendor_id, config.get("po_number"), package_size_id, owner_id,
+            config.get("recieve_date"), number_alpl,
         ),
     )
 
@@ -925,13 +967,12 @@ async def update_part(part_id: int, data: Dict[str, Any] = Body(...)):
     409 ที่อ่านง่ายแทนที่จะปล่อยให้เป็น 500 ดิบๆ
     """
     # field ที่แก้ตรงๆ ได้เลย ไม่ต้อง resolve ผ่าน lookup table
-    direct_fields = {"number_alpl", "part_number", "description", "po_number"}
+    direct_fields = {"number_alpl", "part_number", "description", "po_number", "recieve_date"}
     # field ที่เป็น "ชื่อ" จาก dropdown — ต้อง resolve เป็น id ก่อน (key ที่รับจาก
     # request → (คอลัมน์จริงใน parts, ตาราง lookup, id column, name column))
     lookup_fields = {
         "handler":      ("handler_id",      "handler",      "handler_id",      "handler_name"),
         "vendor":       ("vendor_id",       "vendor",       "vendor_id",       "vendor_name"),
-        "category":     ("category_id",     "category",     "category_id",     "category_name"),
         "owner":        ("owner_id",        "owner",        "owner_id",        "owner_name"),
         "package_size": ("package_size_id", "package_size", "package_size_id", "package_size"),
     }
@@ -1083,8 +1124,8 @@ class MeasurementCreate(BaseModel):
 
 
 class ImageUpdate(BaseModel):
-    # image_path เป็น Optional แล้ว — กรณี Agent อัปโหลดรูปขึ้น MinIO ไม่สำเร็จ
-    # ครบ 3 ครั้ง (ดู agent.py upload_image) จะ PATCH มาด้วย image_path=None,
+    # image_path เป็น Optional แล้ว — กรณี Agent จัดการรูปไม่สำเร็จ
+    # จะ PATCH มาด้วย image_path=None,
     # upload_failed=True แทน เพื่อให้ backend รู้ว่า "พยายามแล้วแต่ไม่สำเร็จ"
     # ต่างจาก "ยังไม่เคยพยายามเลย" (NULL เฉยๆ ตอน insert)
     image_path:    Optional[str] = None
@@ -1458,13 +1499,14 @@ async def update_measurement(measurement_id: int, data: Dict[str, Any] = Body(..
 
 @app.patch("/api/measurements/{measurement_id}/image")
 async def update_image(measurement_id: int, req: ImageUpdate):
-    """แนบ path ของรูปภาพเข้ากับ measurement หลังจากอัปโหลดขึ้น MinIO เรียบร้อยแล้ว
+    """แนบ path ของรูปภาพเข้ากับ measurement หลังจาก Agent จัดเก็บรูปเรียบร้อยแล้ว
+    (เดิมคือหลังอัปโหลดขึ้น MinIO — architecture ใหม่จะเป็น path ของไฟล์ใน
+    โฟลเดอร์บนเครื่อง PC แทน รอดีไซน์การจัดเก็บ finalize ก่อน)
 
-    ทำไมต้องแยก call นี้ออกจาก create_measurement: Agent อัปโหลดรูป inspection
-    ขึ้น MinIO โดยตรงผ่าน presigned URL (ดู /api/upload-url) *หลังจาก* ค่า
-    measurement ถูกบันทึกไปแล้ว endpoint นี้แค่ patch object key ที่ได้กลับมา
-    หลังอัปโหลดเสร็จ การ broadcast 'image_updated' ทำให้ dashboard เปลี่ยน
-    ปุ่มรูปภาพในแถวนั้นได้โดยไม่ต้อง refresh ตารางทั้งหมด
+    ทำไมต้องแยก call นี้ออกจาก create_measurement: Agent จัดเก็บรูป inspection
+    *หลังจาก* ค่า measurement ถูกบันทึกไปแล้ว endpoint นี้แค่ patch path ของ
+    รูปเข้ากับ measurement ทีหลัง การ broadcast 'image_updated' ทำให้ dashboard
+    เปลี่ยนปุ่มรูปภาพในแถวนั้นได้โดยไม่ต้อง refresh ตารางทั้งหมด
     """
     db = get_db()
     try:
@@ -1489,6 +1531,71 @@ async def update_image(measurement_id: int, req: ImageUpdate):
         db.close()
 
 
+@app.post("/api/measurements/{measurement_id}/image-upload")
+async def upload_measurement_image(measurement_id: int, file: UploadFile = File(...)):
+    """รับไฟล์รูปจริง (multipart) จาก Agent แล้วบันทึกลงดิสก์ของเครื่อง PC ที่
+    รัน backend นี้เอง — แทนที่ MinIO เดิมทั้งหมด (ดูหมายเหตุ ALPL_IMAGE_DIR
+    ด้านบน) ต่างจาก update_image (PATCH /image) ตรงที่ endpoint นั้นรับแค่
+    "path" ที่ Agent อ้างว่าเก็บไว้แล้ว (ใช้ได้ตอน Agent+Backend อยู่เครื่อง
+    เดียวกัน) แต่ตอนนี้ Agent อยู่คนละเครื่อง (Pi) กับ backend (PC) จึงต้องรับ
+    "เนื้อไฟล์จริง" มาด้วยเลย แล้ว backend เป็นคนตัดสินใจ path ปลายทางเอง
+
+    path ปลายทาง: ALPL_IMAGE_DIR/<package_size ของ ALPL นี้>/<measurement_id>_<number_alpl><นามสกุลไฟล์>
+    เก็บเป็น "path สัมพัทธ์" (relative ต่อ ALPL_IMAGE_DIR) ลงคอลัมน์
+    measurements.image_path — ไม่เก็บ absolute path เต็มๆ ลง DB เพื่อไม่ให้
+    รั่วโครงสร้างไฟล์ระบบจริงออกไป และให้ /api/image-url ต่อ URL ได้ตรงๆ จาก
+    ค่านี้ (ดู get_image_url ด้านล่าง กับ static mount /media/alpl ท้ายไฟล์)
+    """
+    db = get_db()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT m.number_alpl, ps.package_size "
+                "FROM measurements m "
+                "JOIN parts p ON m.number_alpl = p.number_alpl "
+                "LEFT JOIN package_size ps ON p.package_size_id = ps.package_size_id "
+                "WHERE m.measurement_id = %s",
+                (measurement_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Measurement not found")
+
+            package_folder = _safe_folder_name(row["package_size"])
+            dest_dir = os.path.join(ALPL_IMAGE_DIR, package_folder)
+            os.makedirs(dest_dir, exist_ok=True)
+
+            ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+            filename = f"{measurement_id}_{row['number_alpl']}{ext}"
+            dest_path_abs = os.path.join(dest_dir, filename)
+            image_path_rel = f"{package_folder}/{filename}"  # เก็บลง DB แบบ forward-slash เสมอ (ใช้ต่อ URL ตรงๆ ได้)
+
+            try:
+                with open(dest_path_abs, "wb") as out:
+                    shutil.copyfileobj(file.file, out)
+            except OSError as exc:
+                raise HTTPException(500, f"บันทึกไฟล์รูปไม่สำเร็จ: {exc}")
+            finally:
+                file.file.close()
+
+            cur.execute(
+                "UPDATE measurements SET image_path = %s, image_upload_failed = 0 "
+                "WHERE measurement_id = %s",
+                (image_path_rel, measurement_id),
+            )
+        await push_event(
+            "image_updated",
+            {
+                "measurement_id": measurement_id,
+                "image_path": image_path_rel,
+                "upload_failed": False,
+            },
+        )
+        return {"ok": True, "image_path": image_path_rel}
+    finally:
+        db.close()
+
+
 @app.delete("/api/measurements/{measurement_id}")
 async def delete_measurement(measurement_id: int):
     """ลบ measurement 1 row (เช่น ลบค่าที่อ่านผิดพลาด/เป็นการทดสอบ)"""
@@ -1507,52 +1614,38 @@ async def delete_measurement(measurement_id: int):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Upload / Image URL endpoints
+# Image URL endpoint (stub — รอดีไซน์การจัดเก็บรูปแบบ local folder)
 # ══════════════════════════════════════════════════════════════════════════════
-class UploadUrlRequest(BaseModel):
-    filename:       str
-    measurement_id: int
-
-
-@app.post("/api/upload-url")
-async def get_upload_url(req: UploadUrlRequest):
-    """สร้าง presigned URL ของ MinIO ให้ Agent อัปโหลดรูปขึ้นไปได้โดยตรง
-
-    ทำไมต้องใช้ presigned URL: Agent อัปโหลดรูปขึ้น MinIO ตรงๆ โดยไม่ต้องผ่าน
-    backend ตัวนี้ ทำให้ backend ไม่ต้องเสียเวลารับไฟล์ขนาดใหญ่ และโฟกัสกับงาน
-    DB/session ได้ URL หมดอายุใน 1 ชั่วโมง ซึ่งเพียงพอให้ Agent อัปโหลดเสร็จ
-    หลังจากถ่ายภาพ
-    """
-    object_key = f"measurements/{req.measurement_id}/{req.filename}"
-    mc = get_minio()
-    url = mc.presigned_put_object(MINIO_BUCKET, object_key, expires=timedelta(hours=1))
-    return {"presigned_url": url, "object_key": object_key}
-
-
+# เดิมตรงนี้มี 2 endpoint ที่ผูกกับ MinIO ทั้งคู่:
+#   POST /api/upload-url          — ออก presigned PUT URL ให้ Agent อัปโหลดรูป
+#   GET  /api/image-url/{id}      — ออก presigned GET URL ให้ dashboard ดูรูป
+# architecture ใหม่เลิกใช้ MinIO แล้ว รูปจะเก็บเป็นไฟล์ในโฟลเดอร์บนเครื่อง PC
+# แทน แต่ดีไซน์การจัดเก็บ (โครงสร้างโฟลเดอร์/ชื่อไฟล์/ใครเป็นคนย้ายไฟล์) ยังไม่
+# fix — จึงตัด /api/upload-url ทิ้งไปเลย (Agent ตอนนี้ไม่อัปโหลดรูปแล้ว) ส่วน
+# /api/image-url: ดีไซน์เสร็จแล้ว — image_path ใน DB เป็น path สัมพัทธ์ต่อ
+# ALPL_IMAGE_DIR เสมอ (เช่น "3x3/42_1028.jpg" — ดู upload_measurement_image
+# ด้านบน) จึงต่อ URL ตรงๆ ได้จาก static mount "/media/alpl" (ท้ายไฟล์) ไม่ต้อง
+# ออก presigned URL แบบ MinIO เดิมอีกต่อไป (ไฟล์อยู่บนดิสก์เครื่องนี้ตรงๆ)
 @app.get("/api/image-url/{measurement_id}")
 async def get_image_url(measurement_id: int):
-    """สร้าง presigned URL ของ MinIO ให้ dashboard ใช้สำหรับ *ดู* รูปภาพ
-
-    ทำไมต้องสร้าง URL ใหม่ทุกครั้งแทนเก็บ URL ถาวร: presigned URL จะหมดอายุ
-    (ที่นี่คือ 1 ชั่วโมง) เพื่อความปลอดภัย ดังนั้นทุกครั้งที่ผู้ปฏิบัติงานกดไอคอนรูป
-    (showImage ในฝั่ง frontend) เราจะออก URL ใหม่ที่อายุสั้นแทนการพึ่ง URL
-    ที่สร้างไว้ก่อนหน้านี้
-    """
     db = get_db()
     try:
         with db.cursor() as cur:
             cur.execute(
-                "SELECT image_path FROM measurements WHERE measurement_id = %s",
+                "SELECT image_path, image_upload_failed FROM measurements WHERE measurement_id = %s",
                 (measurement_id,),
             )
             row = cur.fetchone()
-        if not row or not row["image_path"]:
-            raise HTTPException(404, "Image not found")
-        mc = get_minio()
-        url = mc.presigned_get_object(
-            MINIO_BUCKET, row["image_path"], expires=timedelta(hours=1)
-        )
-        return {"url": url}
+        if not row:
+            raise HTTPException(404, "Measurement not found")
+        if not row["image_path"]:
+            detail = (
+                "Agent อัปโหลดรูปไม่สำเร็จ (ลองครบ 3 ครั้งแล้ว)"
+                if row["image_upload_failed"]
+                else "ยังไม่มีรูปสำหรับ measurement นี้"
+            )
+            raise HTTPException(404, detail)
+        return {"url": f"/media/alpl/{row['image_path']}"}
     finally:
         db.close()
 
@@ -1608,6 +1701,17 @@ async def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=measurements.csv"},
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Static image files (รูป ALPL ที่ upload_measurement_image เซฟไว้)
+# ══════════════════════════════════════════════════════════════════════════════
+# ต้อง mount ก่อน static mount ที่ "/" ด้านล่างเสมอ (ตัวนั้นเป็น catch-all จับ
+# ทุก path ที่เหลือ ถ้า mount ทีหลังจะไม่มีทางไปถึง route นี้เลย) — สร้างโฟลเดอร์
+# ไว้ก่อนด้วยเผื่อยังไม่เคยมีรูปมาเลยสักใบ (StaticFiles ต้องการให้ directory
+# มีอยู่จริงตอน mount ไม่งั้น import พังทันที)
+os.makedirs(ALPL_IMAGE_DIR, exist_ok=True)
+app.mount("/media/alpl", StaticFiles(directory=ALPL_IMAGE_DIR), name="alpl-images")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
